@@ -197,6 +197,7 @@ export function LoginPage() {
               marginTop: 32,
               fontSize: 13,
               opacity: 0.75,
+              textAlign: 'center',
             }}
           >
             共青团磁县委员会
@@ -209,6 +210,7 @@ export function LoginPage() {
         <div
           style={{
             width: 400,
+            minHeight: 580,
             padding:
               '48px 40px',
             display:
