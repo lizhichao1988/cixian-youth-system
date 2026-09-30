@@ -1,0 +1,31 @@
+# Render 免费部署配置
+# 在 Render 控制台「Blueprint」方式导入本仓库即可自动识别。
+#
+# 说明：
+#   - 前端（Vite）与后端（Express）打成一个 Web 服务
+#   - 构建时先装前端依赖并 build，再装后端依赖
+#   - 启动后端，后端会顺带托管 dist/ 下的前端页面
+#   - 全程免费（Render Free 计划）
+services:
+  - type: web
+    name: cixian-youth-system
+    runtime: node
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: npm install && npm run build && cd backend && npm install
+    startCommand: node backend/server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: PORT
+        value: "3000"
+      - key: NOCODB_BASE_URL
+        sync: false
+      - key: NOCODB_BASE_ID
+        sync: false
+      - key: NOCODB_API_TOKEN
+        sync: false
+      - key: ALLOWED_ORIGIN
+        sync: false

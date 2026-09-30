@@ -1,0 +1,118 @@
+# =========================================================
+# 磁县青少年帮扶管理系统 —— 线上运行环境
+# =========================================================
+#
+# 四个容器：
+#
+#   db      PostgreSQL 17   数据库（只在本机网络内，不外露）
+#   redis   Redis 7         NocoDB 缓存（不外露）
+#   nocodb  NocoDB          数据中间件（8080，附件签名链接需要）
+#   app     后端 + 前端     对外服务（80）
+#
+# 启动：
+#
+#   docker compose up -d --build
+#
+# =========================================================
+
+services:
+  db:
+    image: postgres:17.10
+    container_name: cixian-db
+    restart: always
+    environment:
+      POSTGRES_DB: nocodb
+      POSTGRES_USER: nocodb
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-nocodb_pass_2026}
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./nocodb_dump.sql:/docker-entrypoint-initdb.d/nocodb_dump.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U nocodb -d nocodb']
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7
+    container_name: cixian-redis
+    restart: always
+    command: redis-server --appendonly no
+
+  nocodb:
+    # 与本地开发环境的镜像完全一致（按摘要锁定），
+    # 保证数据库结构版本匹配，不会触发意外的迁移。
+    image: nocodb/nocodb@sha256:4b760f0d25471fb49707d515f161d9d36b49c88e7ecbe25eded774af385be5a9
+    container_name: cixian-nocodb
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NC_DB: pg://db:5432?u=nocodb&p=${DB_PASSWORD:-nocodb_pass_2026}&d=nocodb
+      NC_REDIS_URL: redis://redis:6379
+      # 公网地址：附件（帮扶照片）的签名链接要用它
+      NC_SITE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      NC_SECURE_ATTACHMENTS: 'true'
+      NC_DISABLE_MUX: 'true'
+      NC_DOCKER: '0.6'
+      NC_TOOL_DIR: /usr/app/data/
+    volumes:
+      - nocodb_data:/usr/app/data
+    # 端口用环境变量控制，方便用非 80/8080 端口演练
+    ports:
+      - '${NOCODB_PORT:-8080}:8080'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:8080/api/v1/health || exit 1']
+      interval: 15s
+      timeout: 8s
+      retries: 30
+
+  nocodb-worker:
+    image: nocodb/nocodb@sha256:4b760f0d25471fb49707d515f161d9d36b49c88e7ecbe25eded774af385be5a9
+    container_name: cixian-nocodb-worker
+    restart: always
+    depends_on:
+      - nocodb
+    environment:
+      NC_DB: pg://db:5432?u=nocodb&p=${DB_PASSWORD:-nocodb_pass_2026}&d=nocodb
+      NC_REDIS_URL: redis://redis:6379
+      NC_SITE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      NC_SECURE_ATTACHMENTS: 'true'
+      NC_DISABLE_MUX: 'true'
+      NC_WORKER_CONTAINER: 'true'
+      NC_DOCKER: '0.6'
+      NC_DB_JSON_FILE: /usr/app/data/db.json
+      NC_TOOL_DIR: /usr/app/data/
+    volumes:
+      - nocodb_data:/usr/app/data
+
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: cixian-app
+    restart: always
+    depends_on:
+      nocodb:
+        condition: service_healthy
+    environment:
+      PORT: 3001
+      NODE_ENV: production
+      NOCODB_BASE_URL: http://nocodb:8080
+      NOCODB_API_TOKEN: ${NOCODB_API_TOKEN}
+      # 传输加密密钥（必须与前端构建时一致）
+      PAYLOAD_ENC_KEY: ${PAYLOAD_ENC_KEY}
+      DATA_ENC_KEY: ${DATA_ENC_KEY}
+      # 公网部署：强制 HTTPS、限定来源、收紧限流
+      FORCE_HTTPS: ${FORCE_HTTPS:-0}
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-*}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-600}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
+    ports:
+      - '${APP_PORT:-80}:3001'
+
+volumes:
+  db_data:
+  nocodb_data:

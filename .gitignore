@@ -1,0 +1,34 @@
+# 依赖
+node_modules/
+
+# 前端构建产物
+dist/
+
+# 环境变量（含密钥，禁止提交）
+.env
+.env.local
+backend/.env
+
+# 日志
+*.log
+
+# 系统文件
+.DS_Store
+
+# 数据库导出文件（大文件，不入库）
+deploy/nocodb_dump.sql
+
+# 数据库导出文件（大文件，不入库）
+deploy/nocodb_dump.sql
+deploy/.env
+
+# 前端构建缓存（Vite 开发态，禁止提交）
+.vite/
+
+# 密钥/临时环境变量（含传输加密密钥，禁止提交）
+.envT0Hsfb
+.env.*.local
+.env.tmp
+
+# 运行时数据（含青少年业务记录/操作日志，禁止提交）
+backend/data/*.json
