@@ -57,12 +57,12 @@ export function LoginPage() {
   const { login } = useAuth()
 
   const [account, setAccount] =
-    useState('admin')
+    useState('')
 
   const [
     password,
     setPassword,
-  ] = useState('admin123')
+  ] = useState('')
 
   const [error, setError] =
     useState('')
