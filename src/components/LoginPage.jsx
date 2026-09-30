@@ -199,7 +199,7 @@ export function LoginPage() {
               opacity: 0.75,
             }}
           >
-            请使用分配的账号登录
+            共青团磁县委员会
           </div>
         </div>
 
