@@ -300,6 +300,7 @@ export function LoginPage() {
                 }
                 placeholder="请输入账号"
                 allowClear
+                autoComplete="off"
               />
             </Form.Item>
 
@@ -328,6 +329,7 @@ export function LoginPage() {
                   />
                 }
                 placeholder="请输入密码"
+                autoComplete="off"
                 onPressEnter={
                   handleSubmit
                 }
