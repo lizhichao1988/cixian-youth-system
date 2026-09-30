@@ -35,8 +35,14 @@ const PORT = process.env.PORT || 3000
 const SCHEMA = 'p0c8s7fcnd9d9d7'
 const SHIM_API_TOKEN = process.env.SHIM_API_TOKEN || ''
 
+// Supabase 连接串常带 ?sslmode=require，而 pg 会把 require 当作 verify-full，
+// 强制校验证书链（Supabase 池化节点可能给出自签名链），从而覆盖下面的
+// rejectUnauthorized:false。这里把 sslmode 去掉，让 ssl 选项真正生效。
+const RAW_DB_URL = process.env.DATABASE_URL || ''
+const DB_URL = RAW_DB_URL.replace(/[?&]sslmode=[^&]*/i, '')
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DB_URL,
   ssl: { rejectUnauthorized: false },
   max: 5,
 })
