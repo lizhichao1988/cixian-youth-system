@@ -233,15 +233,23 @@ function extractIds(raw) {
   return ids.filter((n) => !isNaN(n))
 }
 
-// 取某记录在某关联上的对端 id 列表
-async function getLinkedIds(link, recordId) {
+// 批量取关联：一次查询拿回本页所有记录在“某关联”上的对端 id
+// 返回 { [selfId]: [otherId, ...] }（避免逐行查关联导致的 N+1 查询风暴）
+async function getLinkedIdsBatch(link, selfIds) {
+  if (!selfIds || !selfIds.length) return {}
   const { rows } = await pool.query(
-    `SELECT "${link.otherCol}" AS oid
+    `SELECT "${link.selfCol}" AS sid, "${link.otherCol}" AS oid
        FROM ${q(SCHEMA)}.${q(link.junction)}
-      WHERE "${link.selfCol}" = $1`,
-    [recordId],
+      WHERE "${link.selfCol}" = ANY($1)`,
+    [selfIds],
   )
-  return rows.map((r) => r.oid)
+  const map = {}
+  for (const r of rows) {
+    const s = r.sid
+    if (!map[s]) map[s] = []
+    map[s].push(r.oid)
+  }
+  return map
 }
 
 // 写入/更新关联（replace=true 时先清后插）
@@ -271,25 +279,41 @@ async function applyLinkFields(tableName, recordId, body, replace) {
   }
 }
 
-// 把一行物理记录组装成 NocoDB 风格的记录对象
-async function buildRecord(tableName, row) {
+// 把多行物理记录批量组装成 NocoDB 风格的记录对象
+// 关键性能修复：关联字段不再逐行查询（N+1），而是按“每个关联一次 IN 查询”批量取回。
+async function buildRecords(tableName, rows) {
   const meta = SCHEMA_CACHE[tableName]
   const titleOf = TITLE_OF[tableName] || {}
-  const obj = { Id: row.id }
-  for (const col of meta.cols) {
-    let val = row[col]
-    if (typeof val === 'string' && (val[0] === '[' || val[0] === '{') && (val.slice(-1) === ']' || val.slice(-1) === '}')) {
-      try { val = JSON.parse(val) } catch (_) { /* 保持原字符串 */ }
+  const list = rows.map((row) => {
+    const obj = { Id: row.id }
+    for (const col of meta.cols) {
+      let val = row[col]
+      if (typeof val === 'string' && (val[0] === '[' || val[0] === '{') && (val.slice(-1) === ']' || val.slice(-1) === '}')) {
+        try { val = JSON.parse(val) } catch (_) { /* 保持原字符串 */ }
+      }
+      // 以 NocoDB title 作为返回 key（多数情况 title==物理列名）
+      obj[titleOf[col] || col] = val
     }
-    // 以 NocoDB title 作为返回 key（多数情况 title==物理列名）
-    obj[titleOf[col] || col] = val
-  }
+    return obj
+  })
   const links = LINKS[tableName] || []
-  for (const link of links) {
-    const ids = await getLinkedIds(link, row.id)
-    const arr = ids.map((id) => ({ Id: id }))
-    for (const alias of link.aliases) obj[alias] = arr
+  if (links.length && rows.length) {
+    const ids = rows.map((r) => r.id)
+    for (const link of links) {
+      const linked = await getLinkedIdsBatch(link, ids)
+      list.forEach((obj, idx) => {
+        const oids = linked[rows[idx].id] || []
+        const arr = oids.map((id) => ({ Id: id }))
+        for (const alias of link.aliases) obj[alias] = arr
+      })
+    }
   }
+  return list
+}
+
+// 单条记录的便捷封装（内部同样走批量路径，N=1 时等效）
+async function buildRecord(tableName, row) {
+  const [obj] = await buildRecords(tableName, [row])
   return obj
 }
 
@@ -348,16 +372,19 @@ app.get('/api/v2/tables/:tableId/records', ah(async (req, res) => {
       LIMIT $1 OFFSET $2`,
     [limit, offset],
   )
-  const list = []
-  for (const row of rows) list.push(await buildRecord(tableName, row))
+  const list = await buildRecords(tableName, rows)
+  const { rows: countRows } = await pool.query(
+    `SELECT COUNT(*)::int AS c FROM ${q(SCHEMA)}.${q(tableName)} WHERE __nc_deleted IS NOT TRUE`,
+  )
+  const total = countRows[0].c
   res.json({
     list,
     pageInfo: {
-      total: list.length,
+      total,
       page: Math.floor(offset / limit) + 1,
       pageSize: limit,
       isFirstPage: offset === 0,
-      isLastPage: rows.length < limit,
+      isLastPage: offset + rows.length >= total,
     },
   })
 }))
