@@ -543,19 +543,27 @@ app.use((err, req, res, next) => {
  * 启动
  * =================================================================== */
 async function start() {
-  try {
-    await pool.query('SELECT 1')
-    console.log('[shim] connected to database')
-  } catch (e) {
-    console.error('[shim] DB connect failed:', e.message)
-  }
-  await loadTitleMaps()
-  await loadSchema()
+  // 先监听端口：保证 /api/health 通过，Render 健康检查不会把服务判为失败。
   app.listen(PORT, () => {
     console.log(`[shim] listening on :${PORT}`)
   })
+  // 数据库可能在冷启动时暂时不可达：循环重试，直到 schema 加载成功。
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await pool.query('SELECT 1')
+      await loadTitleMaps()
+      await loadSchema()
+      console.log(`[shim] schema ready (attempt ${attempt})`)
+      break
+    } catch (e) {
+      console.error(`[shim] schema load attempt ${attempt} failed: ${e.message}; retrying in 5s`)
+      await new Promise((r) => setTimeout(r, 5000))
+    }
+  }
 }
 
-start()
+start().catch((e) => {
+  console.error('[shim] fatal startup error:', e)
+})
 
 module.exports = app
