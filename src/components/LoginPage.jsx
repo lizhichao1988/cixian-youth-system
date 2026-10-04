@@ -22,7 +22,6 @@ import {
 
 import {
   LockOutlined,
-  SafetyCertificateOutlined,
   UserOutlined,
 } from '@ant-design/icons'
 
@@ -30,39 +29,16 @@ import {
   useAuth,
 } from '../context/AuthContext'
 
-/**
- * 演示账号提示。
- *
- * 真实使用时可删掉这一段。
- */
-const DEMO_ACCOUNTS = [
-  {
-    label: '系统管理员',
-    account: 'admin',
-    password: 'admin123',
-  },
-  {
-    label: '县级管理员',
-    account: 'county1',
-    password: 'county123',
-  },
-  {
-    label: '乡镇管理员',
-    account: 'guantai',
-    password: 'town123',
-  },
-]
-
 export function LoginPage() {
   const { login } = useAuth()
 
   const [account, setAccount] =
-    useState('admin')
+    useState('')
 
   const [
     password,
     setPassword,
-  ] = useState('admin123')
+  ] = useState('')
 
   const [error, setError] =
     useState('')
@@ -221,9 +197,10 @@ export function LoginPage() {
               marginTop: 32,
               fontSize: 13,
               opacity: 0.75,
+              textAlign: 'center',
             }}
           >
-            请使用分配的账号登录
+            共青团磁县委员会
           </div>
         </div>
 
@@ -233,6 +210,7 @@ export function LoginPage() {
         <div
           style={{
             width: 400,
+            minHeight: 580,
             padding:
               '48px 40px',
             display:
@@ -300,6 +278,7 @@ export function LoginPage() {
                 }
                 placeholder="请输入账号"
                 allowClear
+                autoComplete="off"
               />
             </Form.Item>
 
@@ -328,6 +307,7 @@ export function LoginPage() {
                   />
                 }
                 placeholder="请输入密码"
+                autoComplete="off"
                 onPressEnter={
                   handleSubmit
                 }
@@ -365,67 +345,6 @@ export function LoginPage() {
             </Button>
           </Form>
 
-          <div
-            style={{
-              marginTop: 26,
-              padding: 14,
-              borderRadius: 10,
-              background:
-                '#f6f8fb',
-              fontSize: 12,
-              color:
-                '#6b7688',
-              lineHeight: 1.9,
-            }}
-          >
-            <div
-              style={{
-                display:
-                  'flex',
-                alignItems:
-                  'center',
-                gap: 6,
-                marginBottom: 6,
-                color:
-                  '#1677ff',
-                fontWeight: 600,
-              }}
-            >
-              <SafetyCertificateOutlined />
-              测试账号
-            </div>
-
-            {DEMO_ACCOUNTS.map(
-              (item) => (
-                <div
-                  key={
-                    item.account
-                  }
-                >
-                  {item.label}：
-                  <span
-                    style={{
-                      color:
-                        '#1f2d3d',
-                    }}
-                  >
-                    {item.account}
-                  </span>
-                  {' / '}
-                  <span
-                    style={{
-                      color:
-                        '#1f2d3d',
-                    }}
-                  >
-                    {
-                      item.password
-                    }
-                  </span>
-                </div>
-              ),
-            )}
-          </div>
         </div>
       </div>
 

@@ -52,10 +52,16 @@ git push -u origin main
    - Database Password：记下来（后面要用）
    - Region：选 **Northeast Asia (Tokyo)** 或 **Singapore**（离国内近）
    - 免费层直接创建。
-3. 进入 Project → **Settings → Database**：
-   - 复制 **Connection string** 里的 **URI**（形如
-     `postgresql://postgres:密码@db.xxxx.supabase.co:5432/postgres`）。
-   - 注意用 **5432**（直连），**不要**用 6543 那个连接池地址。
+3. 取连接串（两条路任选）：
+   - **路线 A（推荐）**：项目页顶部一排的 **绿色 Connect 按钮** → 弹出面板 → 选 **Session pooler**
+     （地址 `aws-0-<region>.pooler.supabase.com`，端口 **5432**）或 **Direct connection**
+     （地址 `db.<ref>.supabase.co`）→ 复制面板里的 **URI** 那一行。
+   - **路线 B**：左下角齿轮 **Project Settings → Database → Connection string → URI**。
+   - ⚠️ 只能用端口 **5432**（Session pooler / Direct），**不要**用 **6543**（Transaction pooler，
+     还原数据会失败）。
+   - 复制出来的 URI 里密码是占位符 `[YOUR-PASSWORD]`，**必须替换成建项目时设的数据库密码**；
+     忘了就在同一页点 **Reset database password** 重置一个（纯字母数字最省事）。
+   - 详见 `Supabase取连接串-傻瓜步骤.md`。
 
 ---
 
@@ -70,6 +76,15 @@ bash deploy/restore-to-supabase.sh "刚才复制的URI"
 
 脚本会过滤掉本地的角色/权限语句，把 1181 条数据和全部表关联原样写进 Supabase。
 完成后去 Supabase 后台 **Table Editor** 看一眼，应有 `nc_*` 系列表。
+
+> 如果本机网络到不了 Supabase 的 5432 端口（部分网络/沙箱会拦），用备用通道：
+> ```bash
+> # 终端 1：把远端 5432 经本机代理(Clash 7890) 隧道映射到本地 15432
+> python3 deploy/pg-tunnel.py <supabase-数据库主机> 5432 15432 127.0.0.1:7890
+> # 终端 2：psql 连隧道口，灌数据
+> bash deploy/restore-to-supabase.sh "postgresql://postgres:密码@host.docker.internal:15432/postgres"
+> ```
+> （Docker 容器里 `host.docker.internal` 指向本机；隧道是纯 TCP 转发，TLS 仍端到端到 Supabase。）
 
 > 这一步**只做一次**（首次上线）。以后数据都在 Supabase，换服务器也不丢。
 

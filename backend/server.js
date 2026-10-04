@@ -153,6 +153,7 @@ const RISK_YOUTH_LINK_FIELD_ID = 'c6ting7y677mclx'
  */
 const {
   registerAuthRoutes,
+  requireAuth,
   recordDeletion,
   canAccessYouth,
 } = require('./authApi')
@@ -180,6 +181,65 @@ registerAuthRoutes(
     getHeaders,
   },
 )
+
+/**
+ * =========================================================
+ * 全局接口鉴权（安全兜底，务必放在所有业务路由之前）
+ * =========================================================
+ *
+ * 背景（2026-10-04 修复）：
+ *
+ *     本文件里的业务路由（青少年 / 帮扶 / 风险 / 结对 / 回收站 …）
+ *     此前**没有挂登录校验**，
+ *     authApi 里的 requireAuth 只保护了它自己注册的几条路由。
+ *
+ *     实测后果（未登录时）：
+ *         GET    /api/youth          → 200，直接返回全部 1181 条台账
+ *         GET    /api/help/summary   → 200
+ *         POST   /api/youth          → 进入写流程（仅因参数校验失败）
+ *         DELETE /api/youth/:id      → 进入删除流程
+ *
+ *     也就是说系统一挂到公网，
+ *     任何人不需要账号就能拖走甚至删除全部未成年人数据。
+ *
+ * 处理：
+ *
+ *     在这里统一加一层守卫，
+ *     只有白名单接口允许匿名访问，
+ *     其余 /api/* 一律要求有效登录态。
+ *
+ * 白名单：
+ *     /api/health       容器健康检查（Docker healthcheck）
+ *     /api/auth/login   登录
+ *     /api/auth/logout  登出
+ *
+ * 说明：
+ *     前端每个请求都会带 x-auth-token（见 src/api/http.js），
+ *     所以正常使用不受影响；
+ *     未登录时返回 401，前端会自动退回登录页。
+ */
+const PUBLIC_API_PATHS = new Set([
+  '/api/health',
+  '/api/auth/login',
+  '/api/auth/logout',
+])
+
+app.use('/api', (req, res, next) => {
+  /**
+   * 注意：挂在 '/api' 上以后，
+   * req.path 已经被削掉了前缀，
+   * 必须用 originalUrl 才能拿到完整路径。
+   */
+  const fullPath = String(
+    req.originalUrl || '',
+  ).split('?')[0]
+
+  if (PUBLIC_API_PATHS.has(fullPath)) {
+    return next()
+  }
+
+  return requireAuth(req, res, next)
+})
 
 
 const CACHE_TTL = 60 * 1000

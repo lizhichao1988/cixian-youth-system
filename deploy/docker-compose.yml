@@ -112,7 +112,18 @@ services:
       SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
     ports:
       - '${APP_PORT:-80}:3001'
+    volumes:
+      # ---------------------------------------------------------
+      # 回收站快照 + 操作日志（backend/data/*.json）必须持久化。
+      #
+      # 不挂这个卷的后果：
+      #   每次 docker compose up -d --build 重建 app 容器时，
+      #   容器内的 /app/backend/data 会被重置，
+      #   回收站（已删除记录的还原快照）和操作日志全部清空。
+      # ---------------------------------------------------------
+      - app_data:/app/backend/data
 
 volumes:
   db_data:
   nocodb_data:
+  app_data:
