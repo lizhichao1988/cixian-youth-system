@@ -60,9 +60,17 @@ services:
       NC_TOOL_DIR: /usr/app/data/
     volumes:
       - nocodb_data:/usr/app/data
-    # 端口用环境变量控制，方便用非 80/8080 端口演练
-    ports:
-      - '${NOCODB_PORT:-8080}:8080'
+    # ---------------------------------------------------------
+    # 不再对外发布端口！
+    #
+    # 以前这里直接映射到宿主机 8080，
+    # 等于把 NocoDB 的管理后台也一起放到了公网上。
+    #
+    # 现在由下面的 nc-attach（Nginx）占住 8080，
+    # 只转发附件路径，管理界面访问不到。
+    # ---------------------------------------------------------
+    expose:
+      - '8080'
     healthcheck:
       test: ['CMD-SHELL', 'wget -qO- http://localhost:8080/api/v1/health || exit 1']
       interval: 15s
@@ -87,6 +95,24 @@ services:
       NC_TOOL_DIR: /usr/app/data/
     volumes:
       - nocodb_data:/usr/app/data
+
+  # ---------------- 附件代理：把 NocoDB 后台挡在公网之外 ----------------
+  nc-attach:
+    image: nginx:1.27-alpine
+    container_name: cixian-nc-attach
+    restart: always
+    depends_on: [nocodb]
+    volumes:
+      - ./nginx/attach.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      # 对外只开这一个端口，且只放行 /download、/dltemp、/thumbnail 三类路径
+      - '${NOCODB_PORT:-8080}:8080'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:8080/healthz || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   app:
     build:

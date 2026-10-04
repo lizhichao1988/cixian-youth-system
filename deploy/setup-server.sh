@@ -111,6 +111,35 @@ for i in $(seq 1 30); do
   sleep 3
 done
 
+# ---------------------------------------------------------
+# 6. 还原附件（帮扶照片）
+# ---------------------------------------------------------
+#
+# 数据库里只有照片的路径引用，
+# 图片文件本身要单独放进 NocoDB 的数据卷，
+# 否则页面上所有照片都是裂图。
+if [ -f nocodb_attachments.tar.gz ]; then
+  echo ">>> 还原附件（帮扶照片）..."
+
+  NC_VOL=$(docker inspect cixian-nocodb --format '{{range .Mounts}}{{if eq .Destination "/usr/app/data"}}{{.Name}}{{end}}{{end}}')
+
+  if [ -z "$NC_VOL" ]; then
+    echo "⚠️  没找到 NocoDB 数据卷，跳过附件还原"
+  else
+    docker run --rm \
+      -v "$NC_VOL":/to \
+      -v "$PWD":/from:ro \
+      alpine \
+      sh -c "mkdir -p /to/nc && tar xzf /from/nocodb_attachments.tar.gz -C /to"
+
+    echo ">>> 重启 NocoDB 让附件生效..."
+    docker compose restart nocodb nocodb-worker >/dev/null 2>&1 || true
+    echo "附件还原完成"
+  fi
+else
+  echo ">>> 没有找到 nocodb_attachments.tar.gz，跳过附件还原"
+fi
+
 echo ""
 echo "=========================================="
 echo " 部署完成"

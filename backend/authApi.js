@@ -226,6 +226,66 @@ function destroySession(token) {
  * 中间件：解析登录态
  * =========================================================
  */
+/**
+ * =========================================================
+ * 密码强度校验
+ * =========================================================
+ *
+ * 规则（对新账号、改密码生效，不影响历史账号登录）：
+ *
+ *     1. 必填
+ *     2. 至少 8 位
+ *     3. 必须同时含字母和数字
+ *     4. 不能是连续或重复的简单串（12345678 / 11111111 之类）
+ *     5. 不能等于账号名
+ *
+ * @returns {string} 空串表示通过；非空是给用户看的错误提示
+ */
+function validatePassword(
+  password,
+  options = {},
+) {
+  const { required = false, account = '' } =
+    options
+
+  const value = String(password ?? '')
+
+  if (!value) {
+    return required
+      ? '请设置密码'
+      : ''
+  }
+
+  if (value.length < 8) {
+    return '密码至少 8 位'
+  }
+
+  if (
+    !/[A-Za-z]/.test(value) ||
+    !/\d/.test(value)
+  ) {
+    return '密码必须同时包含字母和数字'
+  }
+
+  if (
+    /^(?:(\d)\1{7,}|12345678|87654321|abcdefgh)$/i.test(
+      value,
+    )
+  ) {
+    return '密码过于简单，请换一个'
+  }
+
+  if (
+    account &&
+    value.toLowerCase() ===
+      String(account).toLowerCase()
+  ) {
+    return '密码不能和账号相同'
+  }
+
+  return ''
+}
+
 function attachUser(req, res, next) {
   const token =
     req.headers['x-auth-token'] ||
@@ -801,6 +861,37 @@ function registerAuthRoutes(app, deps) {
         })
       }
 
+      /**
+       * =====================================================
+       * 密码强度校验（新增）
+       * =====================================================
+       *
+       * 以前这里写的是
+       *
+       *     密码: hashPassword(body.password || '123456')
+       *
+       * 管理员建账号时如果不填密码，
+       * 系统就默默给一个 **123456**，
+       * 而且不告诉任何人。
+       *
+       * 乡镇账号一旦是 123456，
+       * 等于全县台账对任何猜到账号名的人敞开。
+       *
+       * 现在：密码必填、且必须满足强度要求。
+       */
+      const passwordError =
+        validatePassword(
+          body.password,
+          { required: true },
+        )
+
+      if (passwordError) {
+        return res.status(400).json({
+          success: false,
+          message: passwordError,
+        })
+      }
+
       try {
         const response = await fetch(
           NOCODB_BASE_URL +
@@ -817,9 +908,12 @@ function registerAuthRoutes(app, deps) {
               /**
                * 新账号的密码直接以哈希形式落库，
                * 数据库里不再出现明文口令。
+               *
+               * 已通过上面的强度校验，
+               * 不再有 123456 这种默认口令。
                */
               密码: security.hashPassword(
-                body.password || '123456',
+                body.password,
               ),
               角色: body.role || 'town',
               乡镇:
@@ -888,6 +982,28 @@ function registerAuthRoutes(app, deps) {
         body.password !== undefined &&
         String(body.password).trim() !== ''
       ) {
+        /**
+         * 改密码时同样过一遍强度校验
+         * （不填密码表示保持原密码不变，这种情况不校验）。
+         */
+        const updateError =
+          validatePassword(
+            body.password,
+            {
+              account:
+                body.account || '',
+            },
+          )
+
+        if (updateError) {
+          return res
+            .status(400)
+            .json({
+              success: false,
+              message: updateError,
+            })
+        }
+
         fields['密码'] =
           security.hashPassword(
             body.password,
@@ -1012,9 +1128,18 @@ function registerAuthRoutes(app, deps) {
      管理员、县级都可以看，
      但只有管理员能恢复。
      ======================================================= */
+  /**
+   * 回收站里存的是被删除记录的**完整快照**（含姓名、住址等），
+   * 之前只要求“已登录”，乡镇账号也能看到全县的删除记录。
+   *
+   * 现在收紧为县级及以上：
+   *     县级 / 管理员：可查看
+   *     管理员：可恢复
+   *     乡镇：不可查看
+   */
   app.get(
     '/api/system/recycle',
-    requireAuth,
+    requireRole('county'),
     (req, res) => {
       return res.json({
         success: true,
@@ -1240,9 +1365,12 @@ function registerAuthRoutes(app, deps) {
      操作日志
      GET /api/system/logs
      ======================================================= */
+  /**
+   * 操作日志同样只给县级及以上查看。
+   */
   app.get(
     '/api/system/logs',
-    requireAuth,
+    requireRole('county'),
     (req, res) => {
       return res.json({
         success: true,

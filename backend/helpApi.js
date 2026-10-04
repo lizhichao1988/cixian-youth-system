@@ -85,6 +85,12 @@ function registerHelpRoutes(
     TABLE_IDS,
     getHeaders,
     recordDeletion,
+    /**
+     * 由 server.js 注入，用于统计接口按乡镇过滤。
+     * 老版本没有这两个依赖时也不会报错（做了存在性判断）。
+     */
+    loadYouthData,
+    canAccessYouth,
   } = deps
 
   /**
@@ -1138,7 +1144,16 @@ function registerHelpRoutes(
      */
     express.raw({
       type: 'multipart/form-data',
-      limit: '50mb',
+      /**
+       * 原来是 50mb，太大了。
+       *
+       * 公网上一并发上传就能把内存吃光（DoS），
+       * 帮扶照片用不着这么大，
+       * 默认收到 12MB 就够（单张照片校验在下面还会再卡一道）。
+       */
+      limit:
+        process.env.MAX_UPLOAD_SIZE ||
+        '12mb',
     }),
 
     async (req, res) => {
@@ -1174,6 +1189,82 @@ function registerHelpRoutes(
             success: false,
             message:
               '没有接收到文件内容',
+          })
+      }
+
+      /**
+       * ===================================================
+       * 上传内容校验
+       * ===================================================
+       *
+       * 之前这里完全没有校验，
+       * 任何人都能往系统里传任意文件
+       * （可执行程序、带脚本的 HTML …），
+       * 而且是落在附件目录里能被访问的。
+       *
+       * 现在卡两道：
+       *   1. 体积上限
+       *   2. 必须是图片（扩展名 + Content-Type 同时判断）
+       */
+      const maxUploadBytes =
+        Number(
+          process.env
+            .MAX_UPLOAD_MB || 10,
+        ) *
+        1024 *
+        1024
+
+      if (
+        rawBody.length >
+        maxUploadBytes
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message: `照片不能超过 ${
+              Math.round(
+                maxUploadBytes /
+                  1024 /
+                  1024,
+              )
+            }MB`,
+          })
+      }
+
+      /**
+       * 只看报文头部几百字节，
+       * 不用去解析整个 multipart。
+       */
+      const preview = rawBody
+        .subarray(0, 4096)
+        .toString('latin1')
+
+      const nameMatch =
+        /filename="([^"]*)"/.exec(
+          preview,
+        )
+
+      const fileName =
+        nameMatch?.[1] || ''
+
+      const extOk =
+        /\.(jpe?g|png|gif|webp|bmp|heic|heif)$/i.test(
+          fileName,
+        )
+
+      const typeOk =
+        /Content-Type:\s*image\//i.test(
+          preview,
+        )
+
+      if (!extOk || !typeOk) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            message:
+              '只允许上传图片（jpg / png / gif / webp / bmp / heic）',
           })
       }
 
@@ -1623,25 +1714,115 @@ function registerHelpRoutes(
      因此这里直接统计整张表，
      不需要前端一条条去问。
      =================================================== */
+  /**
+   * 取子表记录关联的青少年 Id。
+   *
+   * 子表（结对 / 需求 / 帮扶记录）里
+   * 「青少年基本信息表」字段是一个关联数组，
+   * 取第一个元素的 Id 即可。
+   */
+  function linkedYouthId(row) {
+    const link =
+      row?.[YOUTH_LINK_FIELD]
+
+    const first = Array.isArray(link)
+      ? link[0]
+      : link
+
+    return Number(first?.Id ?? 0)
+  }
+
+  /**
+   * 乡镇账号的数据范围：
+   * 先把本乡镇能看到的青少年 Id 收成一个集合，
+   * 再用它去过滤各张子表。
+   */
+  async function buildTownYouthIdSet(user) {
+    if (
+      !user ||
+      user.role !== 'town' ||
+      typeof loadYouthData !==
+        'function' ||
+      typeof canAccessYouth !==
+        'function'
+    ) {
+      return null
+    }
+
+    try {
+      const data =
+        await loadYouthData(false)
+
+      const visible = (
+        data.records || []
+      ).filter((item) =>
+        canAccessYouth(user, item),
+      )
+
+      return new Set(
+        visible
+          .map((item) =>
+            Number(
+              item.key ??
+                item._raw?.Id ??
+                0,
+            ),
+          )
+          .filter((id) => id > 0),
+      )
+    } catch (error) {
+      console.error(
+        '乡镇数据范围计算失败，按无权限处理：',
+        error?.message || error,
+      )
+
+      return new Set()
+    }
+  }
+
   app.get(
     '/api/help/summary',
     async (req, res) => {
       try {
-        const pairings =
+        /**
+         * 乡镇账号只能统计本乡镇的数据，
+         * 否则会把全县的结对数、需求数全部暴露出去。
+         */
+        const youthIdSet =
+          await buildTownYouthIdSet(
+            req.user,
+          )
+
+        const inScope = (list) =>
+          !youthIdSet
+            ? list
+            : list.filter(
+                (item) =>
+                  youthIdSet.has(
+                    linkedYouthId(
+                      item,
+                    ),
+                  ),
+              )
+
+        const pairings = inScope(
           await fetchWholeTable(
             TABLE_IDS.pairings,
-          )
+          ),
+        )
 
-        const needs =
+        const needs = inScope(
           await fetchWholeTable(
             TABLE_IDS.helpNeeds,
-          )
+          ),
+        )
 
-        const records =
+        const records = inScope(
           await fetchWholeTable(
             TABLE_IDS
               .helpRecords,
-          )
+          ),
+        )
 
         /**
          * 已结对人数：
