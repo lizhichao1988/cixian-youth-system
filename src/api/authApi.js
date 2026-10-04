@@ -44,6 +44,32 @@ export async function fetchSession() {
   )
 }
 
+/**
+ * 修改自己的密码。
+ *
+ * 弱口令账号登录后系统会强制要求改密，
+ * 改完之前所有业务接口都会被后端拒绝（423）。
+ */
+export async function changePassword(
+  oldPassword,
+  newPassword,
+) {
+  return requestJson(
+    '/api/auth/change-password',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type':
+          'application/json',
+      },
+      body: JSON.stringify({
+        oldPassword,
+        newPassword,
+      }),
+    },
+  )
+}
+
 /* ============================================================
    账号管理（管理员）
    ============================================================ */

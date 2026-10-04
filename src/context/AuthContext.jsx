@@ -32,6 +32,7 @@ import {
   fetchSession,
   login as loginRequest,
   logout as logoutRequest,
+  changePassword as changePasswordRequest,
 } from '../api/authApi'
 
 const AuthContext =
@@ -60,6 +61,20 @@ export function AuthProvider({
   ] = useState(true)
 
   /**
+   * 是否处于「弱口令、必须先改密」状态。
+   *
+   * 后端在登录 / 查会话时返回。
+   *
+   * 为 true 时：
+   *     后端除改密接口外全部返回 423，
+   *     前端弹出不可关闭的改密窗口。
+   */
+  const [
+    mustChangePassword,
+    setMustChangePassword,
+  ] = useState(false)
+
+  /**
    * 刷新页面后，
    * 用本地保存的 token 换回用户信息。
    */
@@ -83,12 +98,21 @@ export function AuthProvider({
 
         if (alive) {
           setUser(data.user)
+
+          setMustChangePassword(
+            Boolean(
+              data.mustChangePassword,
+            ),
+          )
         }
       } catch {
         clearToken()
 
         if (alive) {
           setUser(null)
+          setMustChangePassword(
+            false,
+          )
         }
       } finally {
         if (alive) {
@@ -118,6 +142,12 @@ export function AuthProvider({
       setToken(data.token)
       setUser(data.user)
 
+      setMustChangePassword(
+        Boolean(
+          data.mustChangePassword,
+        ),
+      )
+
       return data.user
     },
     [],
@@ -133,9 +163,33 @@ export function AuthProvider({
 
       clearToken()
       setUser(null)
+      setMustChangePassword(false)
     },
     [],
   )
+
+  /**
+   * 改密成功后的收尾：
+   *
+   *     解除前端锁定标记，
+   *     用户不用重新登录就能继续用。
+   */
+  const finishPasswordChange =
+    useCallback(() => {
+      setMustChangePassword(
+        false,
+      )
+
+      setUser((current) =>
+        current
+          ? {
+              ...current,
+              mustChangePassword:
+                false,
+            }
+          : current,
+      )
+    }, [])
 
   /**
    * 是否拥有某个角色及以上权限。
@@ -173,6 +227,25 @@ export function AuthProvider({
       ? user.town
       : ''
 
+  const changePassword =
+    useCallback(
+      async (
+        oldPassword,
+        newPassword,
+      ) => {
+        const data =
+          await changePasswordRequest(
+            oldPassword,
+            newPassword,
+          )
+
+        finishPasswordChange()
+
+        return data
+      },
+      [finishPasswordChange],
+    )
+
   const value = useMemo(
     () => ({
       user,
@@ -182,6 +255,8 @@ export function AuthProvider({
       hasRole,
       canRestore,
       town,
+      mustChangePassword,
+      changePassword,
     }),
     [
       user,
@@ -191,6 +266,8 @@ export function AuthProvider({
       hasRole,
       canRestore,
       town,
+      mustChangePassword,
+      changePassword,
     ],
   )
 

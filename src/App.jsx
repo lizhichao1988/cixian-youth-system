@@ -25,6 +25,10 @@ import {
 } from './components/LoginPage'
 
 import {
+  ForceChangePasswordModal,
+} from './components/ForceChangePasswordModal'
+
+import {
   useAuth,
 } from './context/AuthContext'
 
@@ -129,6 +133,7 @@ function App() {
   const {
     user,
     checking,
+    mustChangePassword,
   } = useAuth()
 
   /**
@@ -178,7 +183,16 @@ function App() {
 
   user,
 
-  ready: !checking,
+  /**
+   * 弱口令未改密时不拉业务数据。
+   *
+   * 否则 /api/youth 会被后端以 423 拒绝，
+   * 页面上反复弹错误提示，
+   * 体验很差而且容易掩盖真正的问题。
+   */
+  ready:
+    !checking &&
+    !mustChangePassword,
 })
 
 /**
@@ -604,6 +618,13 @@ const {
         {contextHolder}
 
         <LoginPage />
+
+        {/*
+          弱口令账号登录成功但还没改密时，
+          后端所有业务接口都会返回 423，
+          这里直接弹窗，不给绕过的机会。
+        */}
+        <ForceChangePasswordModal />
       </>
     )
   }
@@ -721,6 +742,14 @@ const {
           />
         </Drawer>
       </Layout>
+
+      {/*
+        已登录状态下同样要挂：
+        弱口令账号必须改密才能继续使用，
+        后端会把除改密外的接口全部锁住（423）。
+      */}
+      <ForceChangePasswordModal />
+
       <YouthDrawers
         detailRecord={detailRecord}
         drawerOpen={drawerOpen}

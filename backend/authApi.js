@@ -148,23 +148,57 @@ function appendLog(entry) {
  */
 const sessions = new Map()
 
-function createSession(user) {
+function createSession(
+  user,
+  extra = {},
+) {
   /**
    * token 带 HMAC 签名，
    * 别人伪造不出来；
    * 同时带有效期，
    * 过期自动失效。
+   *
+   * extra 用于挂会话级标记，
+   * 例如 mustChangePassword（弱口令登录后必须改密）。
    */
   const { token, expiresAt } =
     security.createSecureToken()
 
   sessions.set(token, {
     ...user,
+    ...extra,
     loginAt: new Date().toISOString(),
     expiresAt,
   })
 
   return token
+}
+
+/**
+ * 清除会话上的「必须改密」标记。
+ *
+ * 改密成功后调用，
+ * 用户不用重新登录就能继续使用系统。
+ */
+function clearMustChangePassword(token) {
+  if (!token) {
+    return
+  }
+
+  const session = sessions.get(
+    String(token).trim(),
+  )
+
+  if (!session) {
+    return
+  }
+
+  delete session.mustChangePassword
+
+  sessions.set(
+    String(token).trim(),
+    session,
+  )
 }
 
 function getSession(token) {
@@ -273,6 +307,55 @@ function validatePassword(
     )
   ) {
     return '密码过于简单，请换一个'
+  }
+
+  /**
+   * 「单词 + 几个数字」这类组合。
+   *
+   * 典型就是系统里现在还在用的：
+   *
+   *     admin123 / county123 / town123 / password1
+   *
+   * 它们长度够、也含字母和数字，
+   * 能绕过上面所有规则，
+   * 但本质是字典词，
+   * 撞库工具第一个就试这些。
+   *
+   * 因此单独识别出来。
+   */
+  if (/^[A-Za-z]+\d{1,4}$/.test(value)) {
+    return (
+      '密码不能是「英文单词 + 简单数字」' +
+      '（例如 admin123），请换一个更复杂的'
+    )
+  }
+
+  /**
+   * 常见弱口令词根。
+   */
+  const WEAK_ROOTS = [
+    'password',
+    'admin',
+    'qwerty',
+    'abc123',
+    'iloveyou',
+    'letmein',
+    'welcome',
+    '123456',
+    '000000',
+    '111111',
+  ]
+
+  const lower = value.toLowerCase()
+
+  if (
+    WEAK_ROOTS.some(
+      (root) =>
+        lower === root ||
+        lower.startsWith(root),
+    )
+  ) {
+    return '密码包含常见弱口令，请换一个'
   }
 
   if (
@@ -566,10 +649,18 @@ function registerAuthRoutes(app, deps) {
     TABLE_IDS.accounts
 
   /**
-   * 登录态中间件必须最早注册，
-   * 这样后续所有路由都能拿到 req.user。
+   * 登录态中间件不再在这里注册。
+   *
+   * 原因：
+   *     registerAuthRoutes() 在 server.js 里
+   *     曾经排在全局守卫之前，
+   *     导致 /api/auth/* 全部绕过守卫，
+   *     弱口令账号登录后仍能直接调用
+   *     账号管理这类高危接口。
+   *
+   * 现在由 server.js 统一在最前面注册 attachUser，
+   * 保证 auth 路由和业务路由一样受守卫保护。
    */
-  app.use(attachUser)
 
   /* =======================================================
      登录
@@ -703,7 +794,35 @@ function registerAuthRoutes(app, deps) {
         ),
       }
 
-      const token = createSession(user)
+      /**
+       * 弱口令检测。
+       *
+       * 这里是唯一能拿到用户明文密码的时机，
+       * 所以直接在登录时判断：
+       *
+       *     密码不符合强度要求 -> 允许登录，
+       *     但会话打上 mustChangePassword 标记。
+       *
+       * 之后所有业务接口都会被全局守卫拦下，
+       * 只能先改密码才能继续使用。
+       *
+       * 这样做的好处是不用改数据库表结构
+       * （NocoDB 加字段要重建元数据，风险大），
+       * 现有 admin123 / county123 / town123
+       * 这类历史弱口令会自动被标记，
+       * 改完强密码后下次登录即恢复正常。
+       */
+      const weakReason =
+        validatePassword(password, {
+          account: user.account,
+        })
+
+      const mustChangePassword =
+        Boolean(weakReason)
+
+      const token = createSession(user, {
+        mustChangePassword,
+      })
 
       appendLog({
         user: user.account,
@@ -716,8 +835,11 @@ function registerAuthRoutes(app, deps) {
         success: true,
         message: '登录成功',
         token,
+        mustChangePassword,
+        weakReason: weakReason || '',
         user: {
           ...user,
+          mustChangePassword,
           roleLabel:
             ROLE_LABEL[user.role] || user.role,
         },
@@ -768,6 +890,9 @@ function registerAuthRoutes(app, deps) {
 
     return res.json({
       success: true,
+      mustChangePassword: Boolean(
+        req.user.mustChangePassword,
+      ),
       user: {
         ...req.user,
         roleLabel:
@@ -776,6 +901,202 @@ function registerAuthRoutes(app, deps) {
       },
     })
   })
+
+  /* =======================================================
+     修改自己的密码
+     POST /api/auth/change-password
+     =======================================================
+
+     入参：
+         oldPassword   原密码
+         newPassword   新密码
+
+     规则：
+         1. 必须登录
+         2. 原密码必须正确
+         3. 新密码必须满足强度要求
+         4. 新密码不能和原密码相同
+         5. 改完清除会话标记，无需重新登录
+
+     这个接口是「弱口令登录后唯一被放行」的业务接口，
+     否则弱口令账号会被全局守卫锁死在系统外面。
+     ======================================================= */
+  app.post(
+    '/api/auth/change-password',
+    async (req, res) => {
+      const user = req.user
+
+      if (!user) {
+        return res.status(401).json({
+          success: false,
+          message: '请先登录',
+        })
+      }
+
+      const oldPassword = String(
+        req.body?.oldPassword ?? '',
+      ).trim()
+
+      const newPassword = String(
+        req.body?.newPassword ?? '',
+      )
+
+      if (!oldPassword || !newPassword) {
+        return res.status(400).json({
+          success: false,
+          message:
+            '请填写原密码和新密码',
+        })
+      }
+
+      /**
+       * 新密码强度校验。
+       */
+      const reason = validatePassword(
+        newPassword,
+        {
+          required: true,
+          account: user.account,
+        },
+      )
+
+      if (reason) {
+        return res.status(400).json({
+          success: false,
+          message: reason,
+        })
+      }
+
+      if (oldPassword === newPassword) {
+        return res.status(400).json({
+          success: false,
+          message:
+            '新密码不能和原密码相同',
+        })
+      }
+
+      try {
+        const response =
+          await fetch(
+            NOCODB_BASE_URL +
+              '/api/v2/tables/' +
+              ACCOUNT_TABLE +
+              '/records?limit=200',
+            { headers: getHeaders() },
+          )
+
+        if (!response.ok) {
+          return res.status(500).json({
+            success: false,
+            message: '账号表读取失败',
+          })
+        }
+
+        const data = await response.json()
+
+        const found = (
+          data?.list || []
+        ).find(
+          (item) =>
+            String(
+              item['账号'] || '',
+            ).trim() ===
+            String(
+              user.account || '',
+            ).trim(),
+        )
+
+        if (!found) {
+          return res.status(404).json({
+            success: false,
+            message: '账号不存在',
+          })
+        }
+
+        /**
+         * 原密码必须正确，
+         * 防止别人拿到已登录的浏览器改密码。
+         */
+        if (
+          !security.verifyPassword(
+            oldPassword,
+            String(found['密码'] || ''),
+          )
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: '原密码不正确',
+          })
+        }
+
+        const patchResponse =
+          await fetch(
+            NOCODB_BASE_URL +
+              '/api/v2/tables/' +
+              ACCOUNT_TABLE +
+              '/records',
+            {
+              method: 'PATCH',
+              headers: getHeaders(),
+              body: JSON.stringify([
+                {
+                  Id: Number(found['Id']),
+                  密码:
+                    security.hashPassword(
+                      newPassword,
+                    ),
+                },
+              ]),
+            },
+          )
+
+        if (!patchResponse.ok) {
+          const text =
+            await patchResponse.text()
+
+          console.error(
+            '修改密码失败：',
+            patchResponse.status,
+            text,
+          )
+
+          return res.status(500).json({
+            success: false,
+            message: '密码保存失败',
+          })
+        }
+
+        /**
+         * 改密成功，解除本次会话的锁定状态。
+         */
+        clearMustChangePassword(
+          req.token,
+        )
+
+        appendLog({
+          user: user.account,
+          name: user.name,
+          action: '修改密码',
+          target: '-',
+        })
+
+        return res.json({
+          success: true,
+          message: '密码修改成功',
+        })
+      } catch (error) {
+        console.error(
+          '修改密码失败：',
+          error,
+        )
+
+        return res.status(500).json({
+          success: false,
+          message: '修改密码失败',
+        })
+      }
+    },
+  )
 
   /* =======================================================
      账号列表（管理员）

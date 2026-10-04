@@ -12,6 +12,46 @@ require('dotenv').config()
  */
 const security = require('./security')
 
+/**
+ * 从 server.js 拆出去的三个模块。
+ *
+ *     lib/fields.js       字段处理（纯函数）
+ *     lib/normalizers.js  NocoDB 记录标准化（纯函数）
+ *     lib/youthStore.js   青少年数据缓存与权限过滤（有状态）
+ *
+ * 拆分前 server.js 接近 4800 行，
+ * 数据加工、权限校验、HTTP 路由全堆在一个文件里，
+ * 改一处要全文搜索、还容易误伤别处。
+ *
+ * 现在按职责分开，server.js 只剩：
+ *     中间件装配 + 路由 + 请求编排
+ */
+const {
+  cleanValue,
+  getObjectText,
+  sanitizeEmptyValues,
+  normalizeDateFields,
+  responsibleUnitForUser,
+  normalizeNeedHelp,
+  firstValue,
+  getRecordFields,
+} = require('./lib/fields')
+
+const {
+  normalizeCategoryRecord,
+  normalizeRiskRecord,
+  normalizeHelpNeedRecord,
+  normalizePairingRecord,
+  normalizeHelpRecord,
+  getLinkedIds,
+  buildRelationMap,
+  normalizeYouthRecords,
+} = require('./lib/normalizers')
+
+const {
+  createYouthStore,
+} = require('./lib/youthStore')
+
 const app = express()
 
 /**
@@ -169,6 +209,7 @@ const RISK_YOUTH_LINK_FIELD_ID = 'c6ting7y677mclx'
  */
 const {
   registerAuthRoutes,
+  attachUser,
   requireAuth,
   recordDeletion,
   canAccessYouth,
@@ -221,14 +262,15 @@ function publicError(error, fallback) {
   return fallback
 }
 
-registerAuthRoutes(
-  app,
-  {
-    NOCODB_BASE_URL,
-    TABLE_IDS,
-    getHeaders,
-  },
-)
+/**
+ * =========================================================
+ * 登录态解析（必须最早）
+ * =========================================================
+ *
+ * 放在这里而不是 registerAuthRoutes() 内部，
+ * 是为了让下面的全局守卫能拿到 req.user。
+ */
+app.use(attachUser)
 
 /**
  * =========================================================
@@ -272,6 +314,25 @@ const PUBLIC_API_PATHS = new Set([
   '/api/auth/logout',
 ])
 
+/**
+ * 弱口令账号被锁定后，
+ * 仍然允许访问的接口。
+ *
+ * 只给这三条活路：
+ *     改密码      否则永远出不来
+ *     查会话信息  前端要知道当前是谁、要不要改密
+ *     退出登录    改不了可以走人
+ *
+ * 其余业务接口一律拒绝，
+ * 这样「必须改密」才是真的强制，
+ * 而不是关掉弹窗就能绕过。
+ */
+const PASSWORD_CHANGE_PATHS = new Set([
+  '/api/auth/change-password',
+  '/api/auth/session',
+  '/api/auth/logout',
+])
+
 app.use('/api', (req, res, next) => {
   /**
    * 注意：挂在 '/api' 上以后，
@@ -286,17 +347,61 @@ app.use('/api', (req, res, next) => {
     return next()
   }
 
-  return requireAuth(req, res, next)
+  return requireAuth(
+    req,
+    res,
+    () => {
+      /**
+       * 登录成功但密码太弱：
+       *
+       *     只允许改密码 / 查会话 / 退出，
+       *     其余接口全部拦下。
+       *
+       * 423 是 HTTP 标准里的 Locked，
+       * 语义上正好对应「账号被锁定」。
+       */
+      if (
+        req.user?.mustChangePassword &&
+        !PASSWORD_CHANGE_PATHS.has(
+          fullPath,
+        )
+      ) {
+        return res
+          .status(423)
+          .json({
+            success: false,
+            code: 'PASSWORD_CHANGE_REQUIRED',
+            message:
+              '当前密码不符合安全要求，请先修改密码后再使用系统',
+          })
+      }
+
+      return next()
+    },
+  )
 })
+
+/**
+ * 登录 / 账号 / 回收站 / 日志路由。
+ *
+ * 注册在全局守卫之后，
+ * 因此 /api/auth/* 同样受守卫保护：
+ *
+ *     未登录          -> 401
+ *     弱口令未改密    -> 423（仅放行改密 / 会话 / 登出）
+ */
+registerAuthRoutes(
+  app,
+  {
+    NOCODB_BASE_URL,
+    TABLE_IDS,
+    getHeaders,
+  },
+)
 
 
 const CACHE_TTL = 60 * 1000
 
-let cache = {
-  records: null,
-  statistics: null,
-  loadedAt: 0
-}
 
 /**
  * 青少年写入工具。
@@ -325,391 +430,6 @@ function getHeaders() {
   return headers
 }
 
-function cleanValue(value) {
-  if (value === null || value === undefined) {
-    return ''
-  }
-
-  if (
-    typeof value === 'string' ||
-    typeof value === 'number' ||
-    typeof value === 'boolean'
-  ) {
-    return String(value)
-  }
-
-  if (Array.isArray(value)) {
-    return value
-      .map(item => cleanValue(item))
-      .filter(Boolean)
-      .join('、')
-  }
-
-  if (typeof value === 'object') {
-    const keys = [
-      'value',
-      'label',
-      'name',
-      'text',
-      'title',
-      'display_value',
-      'displayValue',
-      '名称',
-      '显示值'
-    ]
-
-    for (const key of keys) {
-      if (
-        value[key] !== undefined &&
-        value[key] !== null &&
-        value[key] !== ''
-      ) {
-        const result = cleanValue(value[key])
-
-        if (result) {
-          return result
-        }
-      }
-    }
-
-    return ''
-  }
-
-  return ''
-}
-
-function getObjectText(value, depth = 0, visited = new Set()) {
-  if (value === null || value === undefined) {
-    return ''
-  }
-
-  if (depth > 10) {
-    return ''
-  }
-
-  if (
-    typeof value === 'string' ||
-    typeof value === 'number' ||
-    typeof value === 'boolean'
-  ) {
-    return String(value)
-  }
-
-  if (Array.isArray(value)) {
-    return value
-      .map(item =>
-        getObjectText(item, depth + 1, visited)
-      )
-      .filter(Boolean)
-      .join('、')
-  }
-
-  if (typeof value === 'object') {
-    if (visited.has(value)) {
-      return ''
-    }
-
-    visited.add(value)
-
-    const directKeys = [
-      'value',
-      'label',
-      'name',
-      '名称',
-      '显示值',
-      'display_value',
-      'displayValue',
-      'text',
-      'title',
-      '是否需要帮扶',
-      'needHelp'
-    ]
-
-    for (const key of directKeys) {
-      if (
-        value[key] !== undefined &&
-        value[key] !== null &&
-        value[key] !== ''
-      ) {
-        const text = getObjectText(
-          value[key],
-          depth + 1,
-          visited
-        )
-
-        if (text) {
-          return text
-        }
-      }
-    }
-
-    const wrapperKeys = [
-      'data',
-      'record',
-      'row',
-      'item',
-      'fields',
-      'values'
-    ]
-
-    for (const key of wrapperKeys) {
-      if (
-        value[key] !== undefined &&
-        value[key] !== null
-      ) {
-        const text = getObjectText(
-          value[key],
-          depth + 1,
-          visited
-        )
-
-        if (text) {
-          return text
-        }
-      }
-    }
-  }
-
-  return ''
-}
-
-/**
- * 写入前的字段清洗。
- *
- * 作用：
- *
- *     1. 去掉字符串首尾空格
- *     2. 把空字符串 / undefined 统一转成 null
- *
- * 为什么必须做这一步？
- *
- *     前端编辑表单里没有填的日期字段（出生年月等）
- *     会提交成空字符串 ''。
- *
- *     NocoDB 收到 '' 写日期列时会直接报：
- *
- *         400 The date / time value is invalid.
- *
- *     这就是为什么“新增人员保存失败”。
- *
- *     转成 null 以后 NocoDB 会当成“该字段为空”，
- *     写入成功。
- */
-function sanitizeEmptyValues(fields) {
-  if (
-    !fields ||
-    typeof fields !== 'object'
-  ) {
-    return fields
-  }
-
-  Object.keys(fields).forEach((key) => {
-    const value = fields[key]
-
-    if (
-      value === undefined ||
-      value === null
-    ) {
-      fields[key] = null
-      return
-    }
-
-    if (typeof value === 'string') {
-      const trimmed = value.trim()
-
-      fields[key] =
-        trimmed === '' ? null : trimmed
-    }
-  })
-
-  return fields
-}
-
-/**
- * 日期字段补全。
- *
- * 前端“出生年月”用的是月份选择器，
- * 用户可能只选到 年-月（例如 2005-01）。
- *
- * 但是 NocoDB 的日期列要求 年-月-日，
- * 只给 年-月 会被直接退回 400。
- *
- * 所以这里统一补成当月 1 号：
- *
- *     2005-01      -> 2005-01-01
- *     2005/1       -> 2005-01-01
- *     2005年1月    -> 2005-01-01
- *     2005.01.15   -> 2005-01-15
- */
-const DATE_FIELDS = ['出生年月']
-
-function normalizeDateFields(fields) {
-  if (
-    !fields ||
-    typeof fields !== 'object'
-  ) {
-    return fields
-  }
-
-  DATE_FIELDS.forEach((key) => {
-    if (
-      !Object.prototype.hasOwnProperty.call(
-        fields,
-        key,
-      )
-    ) {
-      return
-    }
-
-    const value = fields[key]
-
-    if (typeof value !== 'string') {
-      return
-    }
-
-    const text = value.trim()
-
-    if (!text) {
-      return
-    }
-
-    const matched = text.match(
-      /^(\d{4})[-/.年](\d{1,2})(?:[-/.月](\d{1,2}))?日?$/,
-    )
-
-    if (!matched) {
-      return
-    }
-
-    const year = matched[1]
-
-    const month = String(
-      matched[2],
-    ).padStart(2, '0')
-
-    const day = matched[3]
-      ? String(matched[3]).padStart(2, '0')
-      : '01'
-
-    fields[key] = `${year}-${month}-${day}`
-  })
-
-  return fields
-}
-
-/**
- * 根据登录账号角色计算归口单位（数据责任单位）。
- *
- * 规则：
- *
- *     管理员     -> 系统管理员
- *     县级管理员 -> 县级管理员
- *     乡镇账号   -> 账号所属乡镇（例如 讲武城镇）
- *     社区账号   -> 社区
- *
- * 这样“录入的数据”天然归属到录入人，
- * 乡镇账号的数据隔离才能稳定生效。
- *
- * 注意：
- *
- * 社区账号在登录态里就是
- * role='town'、town='社区'，
- * 所以直接返回 req.user.town 即可。
- */
-function responsibleUnitForUser(user) {
-  if (!user) {
-    return ''
-  }
-
-  if (user.role === 'admin') {
-    return '系统管理员'
-  }
-
-  if (user.role === 'county') {
-    return '县级管理员'
-  }
-
-  if (user.role === 'town') {
-    return user.town || ''
-  }
-
-  return ''
-}
-
-function normalizeNeedHelp(value) {
-  const text = getObjectText(value)
-    .trim()
-    .toLowerCase()
-
-  if (
-    [
-      '是',
-      '需要',
-      '需要帮扶',
-      '有',
-      'true',
-      'yes',
-      'y',
-      '1'
-    ].includes(text)
-  ) {
-    return '是'
-  }
-
-  if (
-    [
-      '否',
-      '不需要',
-      '无需',
-      '无',
-      '不需要帮扶',
-      'false',
-      'no',
-      'n',
-      '0'
-    ].includes(text)
-  ) {
-    return '否'
-  }
-
-  return ''
-}
-
-function firstValue(fields, names) {
-  for (const name of names) {
-    if (
-      fields &&
-      fields[name] !== undefined &&
-      fields[name] !== null &&
-      fields[name] !== ''
-    ) {
-      return fields[name]
-    }
-  }
-
-  return ''
-}
-
-function getRecordFields(record) {
-  if (!record) {
-    return {}
-  }
-
-  const raw =
-    record.fields &&
-    typeof record.fields === 'object'
-      ? record.fields
-      : record
-
-  /**
-   * 敏感字段（手机号等）在库里是密文，
-   * 读出来统一解密后再往下走。
-   *
-   * 历史明文数据不是 enc1: 开头，
-   * 会原样返回，不受影响。
-   */
-  return security.decryptSensitiveFields(raw)
-}
 
 async function fetchTableRecords(tableId) {
   const records = []
@@ -772,1080 +492,89 @@ async function fetchTableRecords(tableId) {
 // ============================================================
 // 青少年及关联数据标准化
 // ------------------------------------------------------------
+// 记录标准化已迁到 lib/normalizers.js，
+// 数据缓存与权限过滤已迁到 lib/youthStore.js，
+// 这里只保留「装配」。
+//
 // RiskPage 已经直接复用 /api/youth 返回的 allYouthData。
 // 因此这里不再提供风险排查专用分页接口。
 // 风险排查页面的分页属于前端展示分页，
 // 不再单独从后端分页读取青少年数据。
 // ============================================================
 
-function normalizeCategoryRecord(record) {
-  const fields = getRecordFields(record)
+/**
+ * =========================================================
+ * 青少年数据仓储装配
+ * =========================================================
+ *
+ * 缓存、子表索引、数据权限过滤全部在 lib/youthStore.js 内部，
+ * 外部拿不到引用，只能通过这里解构出的方法访问。
+ *
+ * 原来散落在路由里的六处
+ *     cache = { records: null, statistics: null, loadedAt: 0 }
+ * 已统一替换为 clearCache()。
+ */
+const youthStore = createYouthStore({
+  TABLE_IDS,
+  fetchTableRecords,
+  canAccessYouth,
+  cacheTTL: CACHE_TTL,
+})
 
-  const name = cleanValue(
-    firstValue(fields, [
-      '小类名称',
-      '名称',
-      'Title',
-      'title'
-    ])
-  )
+const {
+  buildStatistics,
+  filterByScope,
+  buildScopedStatistics,
+  findYouthById,
+  ensureChildIndex,
+  guardHelpScope,
+  fetchAllYouthData,
+  loadYouthData,
+  getCache,
+  setCache,
+  clearCache,
+} = youthStore
 
-  const bigCategory = cleanValue(
-    firstValue(fields, [
-      '大类',
-      '大类名称',
-      '类别'
-    ])
-  )
-
-  return {
-    id: record.id || record.Id || '',
-    name,
-    bigCategory,
-    raw: record
-  }
-}
-
-function normalizeRiskRecord(record) {
-  const fields = getRecordFields(record)
-
-  const id =
-    record?.Id ??
-    record?.id ??
-    fields.Id ??
-    fields.id ??
-    ''
-
-  const title =
-    firstValue(fields, [
-      'Title',
-      'title',
-      '名称',
-      '标题',
-    ]) || ''
-
-  const date =
-    firstValue(fields, [
-      '排查日期',
-      '日期',
-      '风险排查日期',
-    ]) || ''
-
-  const status =
-    firstValue(fields, [
-      '是否存在风险',
-      '风险状态',
-      '是否有风险',
-    ]) || ''
-
-  const description =
-    firstValue(fields, [
-      '风险隐患描述',
-      '风险描述',
-      '隐患描述',
-    ]) || ''
-
-  const handling =
-    firstValue(fields, [
-      '处置情况',
-      '风险处置情况',
-      '处理情况',
-    ]) || ''
-
-  const inspector =
-    firstValue(fields, [
-      '排查人',
-      '检查人',
-      '排查人员',
-    ]) || ''
-
-  const remark =
-    firstValue(fields, [
-      '备注',
-    ]) || ''
-
-  // 保存风险记录创建时间。
-  //
-  // 作用：
-  // 当同一个青少年在同一天存在多条风险排查记录时，
-  // 前端可以先按照“排查日期”判断新旧，
-  // 如果日期相同，再按照“创建时间”判断新旧。
-  //
-  // 不同版本的 NocoDB 返回字段名称可能略有差异，
-  // 因此这里同时兼容多个可能的字段名称。
-  const createdAt =
-    firstValue(fields, [
-      'CreatedAt',
-      'createdAt',
-      'created_at',
-      '创建时间',
-      '记录创建时间',
-    ]) ||
-    record?.CreatedAt ||
-    record?.createdAt ||
-    record?.created_at ||
-    ''
-
-  return {
-    id,
-    title,
-    date,
-    status,
-    description,
-    handling,
-    inspector,
-    remark,
-
-    // 风险记录创建时间。
-    // 前端 riskUtils.js 会使用它进行同一天记录的排序。
-    createdAt,
-
-    // 保留 NocoDB 原始记录，方便以后扩展。
-    raw: record,
-  }
-}
-
-function normalizeHelpNeedRecord(record) {
-  const fields = getRecordFields(record)
-
-  const type = cleanValue(
-    firstValue(fields, [
-      '需求类型',
-      '类型'
-    ])
-  )
-
-  const description = cleanValue(
-    firstValue(fields, [
-      '需求描述',
-      '描述'
-    ])
-  )
-
-  const solved = cleanValue(
-    firstValue(fields, [
-      '是否已解决',
-      '是否解决'
-    ])
-  )
-
-  return {
-    id: record.id || record.Id || '',
-    title: cleanValue(
-      firstValue(fields, [
-        'Title',
-        'title'
-      ])
-    ),
-    type,
-    description,
-    solved,
-    date: cleanValue(
-      firstValue(fields, [
-        '提出日期'
-      ])
-    ),
-    solvedDate: cleanValue(
-      firstValue(fields, [
-        '解决日期'
-      ])
-    ),
-    remark: cleanValue(
-      firstValue(fields, [
-        '备注'
-      ])
-    ),
-    raw: record
-  }
-}
-
-function normalizePairingRecord(record) {
-  const fields = getRecordFields(record)
-
-  return {
-    id: record.id || record.Id || '',
-    title: cleanValue(
-      firstValue(fields, [
-        'Title',
-        'title'
-      ])
-    ),
-    need: cleanValue(
-      firstValue(fields, [
-        '是否需要结对帮扶'
-      ])
-    ),
-    contact: cleanValue(
-      firstValue(fields, [
-        '帮扶联系人'
-      ])
-    ),
-    phone: cleanValue(
-      firstValue(fields, [
-        '联系电话'
-      ])
-    ),
-    unit: cleanValue(
-      firstValue(fields, [
-        '所属单位',
-        '工作单位'
-      ])
-    ),
-    startDate: cleanValue(
-      firstValue(fields, [
-        '开始日期'
-      ])
-    ),
-    endDate: cleanValue(
-      firstValue(fields, [
-        '结束日期'
-      ])
-    ),
-    status: cleanValue(
-      firstValue(fields, [
-        '帮扶状态'
-      ])
-    ),
-    remark: cleanValue(
-      firstValue(fields, [
-        '备注'
-      ])
-    ),
-    raw: record
-  }
-}
-
-function normalizeHelpRecord(record) {
-  const fields = getRecordFields(record)
-
-  return {
-    id: record.id || record.Id || '',
-    title: cleanValue(
-      firstValue(fields, [
-        'Title',
-        'title'
-      ])
-    ),
-    date: cleanValue(
-      firstValue(fields, [
-        '帮扶日期'
-      ])
-    ),
-    method: cleanValue(
-      firstValue(fields, [
-        '帮扶方式'
-      ])
-    ),
-    content: cleanValue(
-      firstValue(fields, [
-        '帮扶内容'
-      ])
-    ),
-    materials: cleanValue(
-      firstValue(fields, [
-        '帮扶物资'
-      ])
-    ),
-    amount: cleanValue(
-      firstValue(fields, [
-        '帮扶金额'
-      ])
-    ),
-    contact: cleanValue(
-      firstValue(fields, [
-        '帮扶联系人'
-      ])
-    ),
-    remark: cleanValue(
-      firstValue(fields, [
-        '备注'
-      ])
-    ),
-    photos: firstValue(fields, [
-      '帮扶照片'
-    ]),
-    raw: record
-  }
-}
-
-function getLinkedIds(value) {
-  const ids = []
-
-  function walk(item, depth = 0) {
-    if (
-      item === null ||
-      item === undefined ||
-      depth > 10
-    ) {
-      return
-    }
-
-    if (
-      typeof item === 'string' ||
-      typeof item === 'number'
-    ) {
-      ids.push(String(item))
-      return
-    }
-
-    if (Array.isArray(item)) {
-      item.forEach(child =>
-        walk(child, depth + 1)
-      )
-      return
-    }
-
-    if (typeof item === 'object') {
-      const idKeys = [
-        'id',
-        'Id',
-        'ID',
-        'recordId',
-        'record_id'
-      ]
-
-      for (const key of idKeys) {
-        if (
-          item[key] !== undefined &&
-          item[key] !== null &&
-          item[key] !== ''
-        ) {
-          ids.push(String(item[key]))
-          break
-        }
-      }
-
-      const nestedKeys = [
-        'data',
-        'records',
-        'list',
-        'record',
-        'value',
-        'items'
-      ]
-
-      nestedKeys.forEach(key => {
-        if (item[key] !== undefined) {
-          walk(item[key], depth + 1)
-        }
-      })
-    }
-  }
-
-  walk(value)
-
-  return [...new Set(ids)]
-}
-
-function buildRelationMap(records, normalizer) {
-  const map = new Map()
-
-  records.forEach(record => {
-    const id = String(
-      record.id ||
-        record.Id ||
-        ''
-    )
-
-    if (id) {
-      map.set(
-        id,
-        normalizer(record)
-      )
-    }
-  })
-
-  return map
-}
-
-function getRelationField(fields, names) {
-  return firstValue(fields, names)
-}
-
-function normalizeYouthRecords(
-  youthRecords,
-  categoryRecords,
-  riskRecords,
-  helpNeedRecords,
-  pairingRecords,
-  helpRecords
+/**
+ * =========================================================
+ * 单条青少年数据的归属校验
+ * =========================================================
+ *
+ * 覆盖所有 /api/youth/:youthId/... 路由：
+ *
+ *     风险排查 / 帮扶需求 / 结对帮扶 / 帮扶记录
+ *     的查询与写入都走这类路径。
+ *
+ * 修复前的实测结果：
+ *
+ *     讲武城镇账号请求 /api/youth/899/risks
+ *     （899 属于磁州镇）
+ *     直接返回了完整数据，
+ *     连姓名、排查结论都能看到。
+ *
+ *     原因是列表接口 /api/youth 做了按镇过滤，
+ *     但「按 id 查单条」这一路完全没有校验，
+ *     只要猜到 id 就能看。
+ *
+ *     id 是自增整数，
+ *     遍历一遍就能把全县数据拖走，
+ *     比列表越权更隐蔽。
+ *
+ * 处理：
+ *
+ *     乡镇账号访问任何单条数据时，
+ *     先反查这条数据属于哪个乡镇，
+ *     不是本镇一律 403；
+ *     查不到归属同样拒绝（fail closed）。
+ *
+ * 只处理数字 id，
+ * /api/youth/refresh 这类接口不受影响。
+ */
+async function guardYouthScope(
+  req,
+  res,
+  next,
 ) {
-  const categoryMap =
-    buildRelationMap(
-      categoryRecords,
-      normalizeCategoryRecord
-    )
-
-  const riskMap =
-    buildRelationMap(
-      riskRecords,
-      normalizeRiskRecord
-    )
-
-  const helpNeedMap =
-    buildRelationMap(
-      helpNeedRecords,
-      normalizeHelpNeedRecord
-    )
-
-  const pairingMap =
-    buildRelationMap(
-      pairingRecords,
-      normalizePairingRecord
-    )
-
-  const helpRecordMap =
-    buildRelationMap(
-      helpRecords,
-      normalizeHelpRecord
-    )
-
-  const normalized = []
-
-  youthRecords.forEach(
-    (youth, index) => {
-      const fields =
-        getRecordFields(youth)
-
-      const youthId =
-        youth.id ||
-        youth.Id ||
-        'youth-' +
-          (index + 1)
-
-      const rawNeedHelp =
-        firstValue(
-          fields,
-          [
-            '是否需要帮扶',
-            '需要帮扶',
-            '是否需帮扶',
-            'needHelp'
-          ]
-        )
-
-      const needHelp =
-        normalizeNeedHelp(
-          rawNeedHelp
-        )
-
-      const categoryRelation =
-        getRelationField(
-          fields,
-          [
-            '困难类别',
-            '困难类别记录',
-            '困难类别表',
-            '困难类别记录s'
-          ]
-        )
-
-      const riskRelation =
-        getRelationField(
-          fields,
-          [
-            '风险排查记录',
-            '风险排查处置表',
-            '风险排查处置记录',
-            '风险排查情况'
-          ]
-        )
-
-      const helpNeedRelation =
-        getRelationField(
-          fields,
-          [
-            '帮扶需求记录',
-            '帮扶需求',
-            '帮扶需求表'
-          ]
-        )
-
-      const pairingRelation =
-        getRelationField(
-          fields,
-          [
-            '结对帮扶记录',
-            '结对帮扶',
-            '结对帮扶表'
-          ]
-        )
-
-      const helpRecordRelation =
-        getRelationField(
-          fields,
-          [
-            '帮扶记录',
-            '帮扶记录表'
-          ]
-        )
-
-      const categoryIds =
-        getLinkedIds(
-          categoryRelation
-        )
-
-      const riskIds =
-        getLinkedIds(
-          riskRelation
-        )
-
-      const helpNeedIds =
-        getLinkedIds(
-          helpNeedRelation
-        )
-
-      const pairingIds =
-        getLinkedIds(
-          pairingRelation
-        )
-
-      const helpRecordIds =
-        getLinkedIds(
-          helpRecordRelation
-        )
-
-      const categories =
-        categoryIds
-          .map(id =>
-            categoryMap.get(id)
-          )
-          .filter(Boolean)
-
-      const risks =
-        riskIds
-          .map(id =>
-            riskMap.get(id)
-          )
-          .filter(Boolean)
-
-      const helpNeeds =
-        helpNeedIds
-          .map(id =>
-            helpNeedMap.get(id)
-          )
-          .filter(Boolean)
-
-      const pairings =
-        pairingIds
-          .map(id =>
-            pairingMap.get(id)
-          )
-          .filter(Boolean)
-
-      const youthHelpRecords =
-        helpRecordIds
-          .map(id =>
-            helpRecordMap.get(id)
-          )
-          .filter(Boolean)
-
-      const categoryNames =
-        categories
-          .map(item => item.name)
-          .filter(Boolean)
-
-      const bigCategories =
-        categories
-          .map(item =>
-            item.bigCategory
-          )
-          .filter(Boolean)
-
-      normalized.push({
-        key:
-          String(youthId),
-
-        sequence:
-          cleanValue(
-            firstValue(
-              fields,
-              [
-                '序号',
-                '编号'
-              ]
-            )
-          ),
-
-        name:
-          cleanValue(
-            firstValue(
-              fields,
-              [
-                '姓名',
-                'Name'
-              ]
-            )
-          ),
-
-        gender:
-          cleanValue(
-            firstValue(
-              fields,
-              [
-                '性别'
-              ]
-            )
-          ),
-
-        birthday:
-          cleanValue(
-            firstValue(
-              fields,
-              [
-                '出生年月',
-                '出生日期'
-              ]
-            )
-          ),
-
-        political:
-          cleanValue(
-            firstValue(
-              fields,
-              [
-                '政治面貌'
-              ]
-            )
-          ),
-
-        household:
-          cleanValue(
-            firstValue(
-              fields,
-              [
-                '户籍地'
-              ]
-            )
-          ),
-
-        residence:
-          cleanValue(
-            firstValue(
-              fields,
-              [
-                '常住地'
-              ]
-            )
-          ),
-
-        /**
-         * 归口单位（数据责任单位）。
-         *
-         * 乡镇账号的数据隔离
-         * 改为比对这个字段，
-         * 而不是户籍地 / 常住地文本。
-         */
-        responsibleUnit:
-          cleanValue(
-            firstValue(
-              fields,
-              [
-                '归口单位',
-                'responsible_unit'
-              ]
-            )
-          ),
-
-        basic:
-          cleanValue(
-            firstValue(
-              fields,
-              [
-                '基本情况',
-                '家庭情况'
-              ]
-            )
-          ),
-
-        phone:
-          cleanValue(
-            firstValue(
-              fields,
-              [
-                '联系方式',
-                '联系电话',
-                '手机号码'
-              ]
-            )
-          ),
-
-        guardian:
-          cleanValue(
-            firstValue(
-              fields,
-              [
-                '监护人',
-                '监护人姓名'
-              ]
-            )
-          ),
-
-        guardianPhone:
-          cleanValue(
-            firstValue(
-              fields,
-              [
-                '监护人联系方式',
-                '监护人电话'
-              ]
-            )
-          ),
-
-        remark:
-          cleanValue(
-            firstValue(
-              fields,
-              [
-                '备注'
-              ]
-            )
-          ),
-
-        needHelp,
-
-        /**
-         * 数据时间戳。
-         *
-         * 数据统计页的“按日期纵向对比”
-         * 依赖这个字段：
-         *
-         *     统计某个日期截止时的数据，
-         *     就是取 数据时间戳 <= 该日期 的记录。
-         *
-         * 没有时间戳时退化为创建时间。
-         */
-        timestamp:
-          cleanValue(
-            firstValue(
-              fields,
-              ['数据时间戳']
-            )
-          ) ||
-          cleanValue(
-            youth.CreatedAt
-          ),
-
-        bigCategory:
-          [
-            ...new Set(
-              bigCategories
-            )
-          ].join('、'),
-
-        categories:
-          [
-            ...new Set(
-              categoryNames
-            )
-          ],
-
-        risks,
-
-        helpNeeds,
-
-        pairing:
-          pairings.length > 0
-            ? pairings[0].need
-            : '',
-
-        pairingContact:
-          pairings.length > 0
-            ? pairings[0].contact
-            : '',
-
-        pairingPhone:
-          pairings.length > 0
-            ? pairings[0].phone
-            : '',
-
-        pairingUnit:
-          pairings.length > 0
-            ? pairings[0].unit
-            : '',
-
-        pairingRecords:
-          pairings,
-
-        // 完整的帮扶记录数组，供青少年详情页使用
-        helpRecordList:
-          youthHelpRecords,
-
-        // 帮扶记录数量，供列表页和统计使用
-        helpRecords:
-          youthHelpRecords.length,
-
-        helpRecordCount:
-          youthHelpRecords.length,
-
-        _raw:
-          youth
-      })
-    }
-  )
-
-  const needYesCount =
-    normalized.filter(
-      record =>
-        record.needHelp === '是'
-    ).length
-
-  const needNoCount =
-    normalized.filter(
-      record =>
-        record.needHelp === '否'
-    ).length
-
-  const needEmptyCount =
-    normalized.length -
-    needYesCount -
-    needNoCount
-
-  console.log(
-    '青少年数据：' +
-      normalized.length +
-      ' 条'
-  )
-
-  console.log(
-    '是否需要帮扶=是：' +
-      needYesCount +
-      ' 条'
-  )
-
-  console.log(
-    '是否需要帮扶=否：' +
-      needNoCount +
-      ' 条'
-  )
-
-  console.log(
-    '是否需要帮扶=空：' +
-      needEmptyCount +
-      ' 条'
-  )
-
-  return normalized
-}
-
-function buildStatistics(records) {
-  const total =
-    records.length
-
-  const needHelpCount =
-    records.filter(
-      record =>
-        record.needHelp === '是'
-    ).length
-
-  const needHelpNoCount =
-    records.filter(
-      record =>
-        record.needHelp === '否'
-    ).length
-
-  const riskCount =
-    records.filter(
-      record =>
-        Array.isArray(
-          record.risks
-        ) &&
-        record.risks.length > 0
-    ).length
-
-  const helpNeedCount =
-    records.filter(
-      record =>
-        Array.isArray(
-          record.helpNeeds
-        ) &&
-        record.helpNeeds.length > 0
-    ).length
-
-  const pairingCount =
-    records.filter(
-      record =>
-        Array.isArray(
-          record.pairingRecords
-        ) &&
-        record.pairingRecords.length > 0
-    ).length
-
-  const helpRecordCount =
-    records.reduce(
-      (total, record) =>
-        total +
-        Number(
-          record.helpRecordCount ||
-            0
-        ),
-      0
-    )
-
-  return {
-    total,
-    needHelpCount,
-    needHelpNoCount,
-    riskCount,
-    helpNeedCount,
-    pairingCount,
-    helpRecordCount
-  }
-}
-
-/**
- * =========================================================
- * 按登录用户的数据权限过滤记录
- * =========================================================
- *
- * 乡镇管理员只能看到「归口单位 = 本乡镇」的记录，
- * 县级与管理员不受限制。
- *
- * 抽成独立函数的原因：
- *
- *     之前每段接口各自写一遍过滤，
- *     /api/youth/refresh 就漏掉了，
- *     乡镇账号一刷新就能拿到全县 1181 条数据。
- *     现在所有出口统一走这里，漏一处都不行。
- */
-function filterByScope(user, records) {
-  if (
-    !user ||
-    user.role !== 'town' ||
-    !Array.isArray(records)
-  ) {
-    return records
-  }
-
-  return records.filter(item =>
-    canAccessYouth(user, item),
-  )
-}
-
-/**
- * 统计数字也必须按可见范围计算。
- *
- * 否则乡镇账号虽然列表只看到本镇几十条，
- * 却能从 statistics 里读到全县的总数、风险数、帮扶数，
- * 一样是越权泄露。
- */
-function buildScopedStatistics(
-  user,
-  records,
-) {
-  return buildStatistics(
-    filterByScope(user, records),
-  )
-}
-
-/**
- * 按青少年 Id 找到记录（供帮扶模块的归属校验用）。
- */
-function findYouthById(id) {
-  const target = String(id ?? '').trim()
-
-  if (!target || !cache.records) {
-    return null
-  }
-
-  return (
-    cache.records.find(
-      item =>
-        String(item.key ?? '') ===
-          target ||
-        String(item._raw?.Id ?? '') ===
-          target,
-    ) || null
-  )
-}
-
-/**
- * =========================================================
- * 帮扶子表记录 → 所属青少年的索引
- * =========================================================
- *
- * 用途：
- *
- *     帮扶 / 风险 / 结对 / 帮扶记录这些子表的
- *     新增、修改、删除接口此前完全没有归属校验，
- *     乡镇账号可以直接改删别的乡镇的数据。
- *
- *     要判断归属，就得从子表 id 反查它属于哪条青少年记录。
- *     这里直接用已经缓存好的青少年数据建索引，
- *     不需要额外请求 NocoDB。
- */
-let childIndexMap = new Map()
-let childIndexBuiltAt = 0
-
-function ensureChildIndex(data) {
-  /**
-   * 数据刷新过就重建索引。
-   *
-   * cache.loadedAt 是 Date.now() 时间戳，
-   * 每次重新拉数据时都会变。
-   */
-  if (
-    childIndexBuiltAt ===
-      data.loadedAt &&
-    childIndexMap.size > 0
-  ) {
-    return childIndexMap
-  }
-
-  const map = new Map()
-
-  const records =
-    Array.isArray(data?.records)
-      ? data.records
-      : []
-
-  records.forEach(youth => {
-    if (!youth || typeof youth !== 'object') {
-      return
-    }
-
-    /**
-     * 遍历青少年记录里的每一个数组字段，
-     * 只要数组元素是带 id 的对象，就登记到索引里。
-     *
-     * 这样不用逐个字段名去猜，
-     * 以后新增子表也自动覆盖。
-     */
-    Object.values(youth).forEach(value => {
-      if (!Array.isArray(value)) {
-        return
-      }
-
-      value.forEach(child => {
-        if (
-          child &&
-          typeof child === 'object' &&
-          child.id != null
-        ) {
-          map.set(
-            String(child.id),
-            youth,
-          )
-        }
-      })
-    })
-  })
-
-  childIndexMap = map
-  childIndexBuiltAt = data.loadedAt
-
-  return map
-}
-
-/**
- * 乡镇账号操作帮扶数据时，
- * 校验目标记录是否属于本乡镇。
- *
- * 原则：**查不到归属就拒绝**（fail closed），
- * 宁可让正常操作失败一次，
- * 也不能放行一次越权。
- */
-async function guardHelpScope(req, res, next) {
   const user = req.user
 
   /**
@@ -1855,199 +584,76 @@ async function guardHelpScope(req, res, next) {
     return next()
   }
 
-  /**
-   * 只读请求后面会单独处理（summary 已按范围计算），
-   * 这里只拦写入类操作。
-   */
-  const method = String(
-    req.method || '',
-  ).toUpperCase()
+  const youthId = String(
+    req.params?.youthId ?? '',
+  ).trim()
 
-  if (
-    method === 'GET' ||
-    method === 'HEAD' ||
-    method === 'OPTIONS'
-  ) {
+  /**
+   * 只处理数字 id。
+   *
+   * /api/youth/refresh 这类接口也会匹配到
+   * :youthId，但它的 id 不是数字，
+   * 直接放行交给真正的路由处理，
+   * 否则刷新接口会被误拦。
+   *
+   * （path-to-regexp 新版本已不支持
+   *   :youthId(\\d+) 这种内联正则写法，
+   *   所以判断放在这里。）
+   */
+  if (!/^\d+$/.test(youthId)) {
     return next()
   }
 
   try {
-    const data = await loadYouthData(false)
-    const index = ensureChildIndex(data)
-
-    let youth = null
-
     /**
-     * 注意：
-     *
-     *     本函数是 app.use() 挂载的中间件，
-     *     在中间件里 req.params 是空的
-     *     （params 要等路由真正匹配时才填充），
-     *     所以必须从 URL 里自己解析。
-     *
-     *     /api/help/pairings/1784        → [pairings, 1784]
-     *     /api/help/help-records/12/photo → [help-records, 12, photo]
-     *
-     *     逐段尝试，命中即止，
-     *     这样两种路径都能覆盖。
+     * 先确保缓存里有数据，
+     * findYouthById 依赖这份缓存做反查。
      */
-    const path = String(
-      req.originalUrl ||
-        req.url ||
-        '',
-    ).split('?')[0]
+    await loadYouthData(false)
 
-    const parts = path
-      .split('/')
-      .filter(Boolean)
-
-    const rest =
-      parts[0] === 'api' &&
-      parts[1] === 'help'
-        ? parts.slice(2)
-        : parts
-
-    for (const segment of rest) {
-      const candidate =
-        String(segment).trim()
-
-      if (!candidate) {
-        continue
-      }
-
-      youth =
-        index.get(candidate) ||
-        findYouthById(candidate)
-
-      if (youth) {
-        break
-      }
-    }
-
-    /**
-     * 新增接口还没有记录 id，
-     * 用请求体里的青少年 Id 判断归属。
-     */
-    if (!youth) {
-      const bodyYouthId = String(
-        req.body?.youthId ??
-          req.body?.Id ??
-          req.body?.id ??
-          '',
-      ).trim()
-
-      if (bodyYouthId) {
-        youth = findYouthById(bodyYouthId)
-      }
-    }
+    const youth = findYouthById(youthId)
 
     if (!youth) {
       return res.status(403).json({
         success: false,
         message:
-          '无法确认这条数据的归属单位，已拒绝操作。请刷新页面后重试。',
+          '无法确认这条数据的归属单位，已拒绝访问。请刷新页面后重试。',
       })
     }
 
-    if (!canAccessYouth(user, youth)) {
+    if (
+      !canAccessYouth(user, youth)
+    ) {
       return res.status(403).json({
         success: false,
         message:
-          '只能操作本乡镇（归口单位）的数据',
+          '只能查看或操作本乡镇（归口单位）的数据',
       })
     }
 
     return next()
   } catch (error) {
     console.error(
-      '帮扶数据归属校验失败：',
+      '单条数据归属校验失败：',
       error,
     )
 
     return res.status(403).json({
       success: false,
       message:
-        '数据归属校验失败，已拒绝操作',
+        '数据归属校验失败，已拒绝访问',
     })
   }
 }
 
-async function fetchAllYouthData() {
-  const [
-    youthRecords,
-    categoryRecords,
-    riskRecords,
-    helpNeedRecords,
-    pairingRecords,
-    helpRecords
-  ] = await Promise.all([
-    fetchTableRecords(
-      TABLE_IDS.youth
-    ),
-    fetchTableRecords(
-      TABLE_IDS.categories
-    ),
-    fetchTableRecords(
-      TABLE_IDS.risks
-    ),
-    fetchTableRecords(
-      TABLE_IDS.helpNeeds
-    ),
-    fetchTableRecords(
-      TABLE_IDS.pairings
-    ),
-    fetchTableRecords(
-      TABLE_IDS.helpRecords
-    )
-  ])
+/**
+ * 必须挂在所有 /api/youth/... 路由之前。
+ */
+app.use(
+  '/api/youth/:youthId',
+  guardYouthScope,
+)
 
-  const records =
-    normalizeYouthRecords(
-      youthRecords,
-      categoryRecords,
-      riskRecords,
-      helpNeedRecords,
-      pairingRecords,
-      helpRecords
-    )
-
-  return {
-    records,
-    statistics:
-      buildStatistics(
-        records
-      ),
-    loadedAt:
-      new Date().toISOString()
-  }
-}
-
-async function loadYouthData(
-  force = false
-) {
-  const now =
-    Date.now()
-
-  if (
-    !force &&
-    cache.records &&
-    now -
-      cache.loadedAt <
-      CACHE_TTL
-  ) {
-    return cache
-  }
-
-  const data =
-    await fetchAllYouthData()
-
-  cache = {
-    ...data,
-    loadedAt: now
-  }
-
-  return cache
-}
 
 app.get(
   '/api/health',
@@ -2810,11 +1416,7 @@ app.post(
        *
        * 会重新同步。
        */
-      cache = {
-        records: null,
-        statistics: null,
-        loadedAt: 0,
-      }
+      clearCache()
 
      /*
       * =====================================================
@@ -3440,11 +2042,7 @@ app.put(
        * 避免前端继续看到旧数据。
        * ===================================================
        */
-      cache = {
-        records: null,
-        statistics: null,
-        loadedAt: 0,
-      }
+      clearCache()
 
       console.log(
         '风险排查记录修改成功：',
@@ -3635,11 +2233,7 @@ app.delete(
         })
       }
 
-      cache = {
-        records: null,
-        statistics: null,
-        loadedAt: 0,
-      }
+      clearCache()
 
       console.log(
         '风险排查记录删除成功：',
@@ -4139,11 +2733,7 @@ app.put('/api/youth/:id', async (req, res) => {
 
     // 写入成功以后立即清除后端缓存。
     // 下一次读取时会重新从 NocoDB 获取最新数据。
-    cache = {
-      records: null,
-      statistics: null,
-      loadedAt: 0,
-    }
+    clearCache()
 
     console.log(
       'NocoDB 写入成功：',
@@ -4334,11 +2924,7 @@ app.delete(
           })
       }
 
-      cache = {
-        records: null,
-        statistics: null,
-        loadedAt: 0,
-      }
+      clearCache()
 
       recordDeletion({
         kind: 'youth',
@@ -4620,11 +3206,7 @@ app.post(
        * 强制刷新，
        * 把新建的这条记录标准化后返回。
        */
-      cache = {
-        records: null,
-        statistics: null,
-        loadedAt: 0,
-      }
+      clearCache()
 
       const data =
         await loadYouthData(true)

@@ -1,31 +1,125 @@
 import {
-  Dashboard,
-} from './dashboard/Dashboard'
+  Suspense,
+  lazy,
+} from 'react'
 
-import {
-  YouthPage,
-} from './youth/YouthPage'
-
-import {
-  RiskPage,
-} from './risk/RiskPage'
-
-import {
-  HelpManagePage,
-} from './help/HelpManagePage'
-
-import {
-  StatisticsPage,
-} from './statistics/StatisticsPage'
-
-import {
-  SystemManagePage,
-} from './system/SystemManagePage'
+import { Spin } from 'antd'
 
 import {
   ModulePlaceholder,
 } from './common/ModulePlaceholder'
 
+/**
+ * =========================================================
+ * 页面级懒加载
+ * =========================================================
+ *
+ * 改造前：
+ *
+ *     六个页面在首屏一次性全部打包加载，
+ *     哪怕用户只打算看「青少年信息」，
+ *     帮扶管理、数据统计、系统管理的代码
+ *     也都要先下载下来。
+ *
+ *     首屏 JS 接近 2MB，
+ *     乡镇网络下打开要等好几秒。
+ *
+ * 改造后：
+ *
+ *     每个页面单独打包成一个 chunk，
+ *     点开哪个页面才下载哪个。
+ *
+ *     首屏只需要下载外壳 + 当前页面，
+ *     首次打开明显变快；
+ *     而且以后只改某一个页面，
+ *     用户浏览器只需重新下载那个 chunk，
+ *     其余走缓存。
+ *
+ * =========================================================
+ */
+
+const Dashboard = lazy(() =>
+  import('./dashboard/Dashboard').then(
+    (m) => ({
+      default: m.Dashboard,
+    }),
+  ),
+)
+
+const YouthPage = lazy(() =>
+  import('./youth/YouthPage').then(
+    (m) => ({
+      default: m.YouthPage,
+    }),
+  ),
+)
+
+const RiskPage = lazy(() =>
+  import('./risk/RiskPage').then(
+    (m) => ({
+      default: m.RiskPage,
+    }),
+  ),
+)
+
+const HelpManagePage = lazy(() =>
+  import('./help/HelpManagePage').then(
+    (m) => ({
+      default: m.HelpManagePage,
+    }),
+  ),
+)
+
+const StatisticsPage = lazy(
+  () =>
+    import(
+      './statistics/StatisticsPage'
+    ).then((m) => ({
+      default: m.StatisticsPage,
+    })),
+)
+
+const SystemManagePage = lazy(
+  () =>
+    import(
+      './system/SystemManagePage'
+    ).then((m) => ({
+      default: m.SystemManagePage,
+    })),
+)
+
+/**
+ * 加载中的占位。
+ *
+ * 页面 chunk 只有几十 KB，
+ * 正常情况下一闪而过；
+ * 乡镇网络慢时至少有个反馈，
+ * 不会看起来像卡死。
+ */
+function PageLoading() {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent:
+          'center',
+        minHeight: 280,
+      }}
+    >
+      <Spin
+        size="large"
+        tip="页面加载中…"
+      >
+        <div
+          style={{
+            padding: 24,
+          }}
+        />
+      </Spin>
+    </div>
+  )
+}
 
 /**
  * =========================================================
@@ -46,8 +140,17 @@ import {
  * 3. help
  *    需帮扶人员信息
  *
- * 4. 其他页面
- *    暂时显示占位页面
+ * 4. risk
+ *    风险排查
+ *
+ * 5. helpManage
+ *    帮扶管理
+ *
+ * 6. statistics
+ *    数据统计
+ *
+ * 7. system
+ *    系统管理
  *
  * =========================================================
  *
@@ -68,20 +171,13 @@ import {
  *
  * =========================================================
  */
-
-
-/**
- * =========================================================
- * PageContent
- * =========================================================
- */
 export function PageContent({
   activePage,
 
   dashboardProps,
 
   youthPageProps,
-  
+
   riskPageProps,
 
   helpManageProps,
@@ -100,12 +196,17 @@ export function PageContent({
     'dashboard'
   ) {
     return (
-      <Dashboard
-        {...dashboardProps}
-      />
+      <Suspense
+        fallback={
+          <PageLoading />
+        }
+      >
+        <Dashboard
+          {...dashboardProps}
+        />
+      </Suspense>
     )
   }
-
 
   /**
    * =======================================================
@@ -119,13 +220,19 @@ export function PageContent({
       'help'
   ) {
     return (
-      <YouthPage
-        {...youthPageProps}
-      />
+      <Suspense
+        fallback={
+          <PageLoading />
+        }
+      >
+        <YouthPage
+          {...youthPageProps}
+        />
+      </Suspense>
     )
   }
 
-    /**
+  /**
    * =======================================================
    * 风险排查
    * =======================================================
@@ -140,9 +247,15 @@ export function PageContent({
     'risk'
   ) {
     return (
-      <RiskPage
-        {...riskPageProps}
-      />
+      <Suspense
+        fallback={
+          <PageLoading />
+        }
+      >
+        <RiskPage
+          {...riskPageProps}
+        />
+      </Suspense>
     )
   }
 
@@ -166,9 +279,15 @@ export function PageContent({
     'helpManage'
   ) {
     return (
-      <HelpManagePage
-        {...helpManageProps}
-      />
+      <Suspense
+        fallback={
+          <PageLoading />
+        }
+      >
+        <HelpManagePage
+          {...helpManageProps}
+        />
+      </Suspense>
     )
   }
 
@@ -182,9 +301,15 @@ export function PageContent({
     'statistics'
   ) {
     return (
-      <StatisticsPage
-        {...statisticsProps}
-      />
+      <Suspense
+        fallback={
+          <PageLoading />
+        }
+      >
+        <StatisticsPage
+          {...statisticsProps}
+        />
+      </Suspense>
     )
   }
 
@@ -201,9 +326,15 @@ export function PageContent({
     'system'
   ) {
     return (
-      <SystemManagePage
-        {...systemProps}
-      />
+      <Suspense
+        fallback={
+          <PageLoading />
+        }
+      >
+        <SystemManagePage
+          {...systemProps}
+        />
+      </Suspense>
     )
   }
 
