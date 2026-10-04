@@ -322,6 +322,15 @@ function registerHelpRoutes(
   ) {
     const all = []
 
+    /**
+     * 每页取 1000 条，和主表保持一致。
+     *
+     * 原来是 200，
+     * 1200 条的子表要发 6 次请求，
+     * 线上数据源有频率限制，容易撞上限流。
+     */
+    const limit = 1000
+
     let offset = 0
 
     while (true) {
@@ -329,7 +338,9 @@ function registerHelpRoutes(
         NOCODB_BASE_URL +
         '/api/v2/tables/' +
         tableId +
-        '/records?limit=200&offset=' +
+        '/records?limit=' +
+        limit +
+        '&offset=' +
         offset
 
       const response =
@@ -357,14 +368,64 @@ function registerHelpRoutes(
 
       all.push(...list)
 
-      const total =
-        parsed?.pageInfo
-          ?.totalRows ?? 0
+      /**
+       * 分页终止条件。
+       *
+       * 原来只认 pageInfo.totalRows，
+       * 而现在的数据源（NocoDB 部分版本 / 自建 shim）
+       * 返回的是 pageInfo.total，
+       * 于是 total 算出来是 0，
+       * 第一次循环就满足 all.length >= 0 直接退出，
+       * 结果整张表只取到第一页。
+       *
+       * 表现就是：
+       *     帮扶总览统计全是 0、
+       *     点开某个人看不到已有的帮扶记录。
+       *
+       * 现在三个条件一起判断，
+       * 缺哪个都能正确翻页。
+       */
+      const pageInfo =
+        parsed?.pageInfo || {}
 
+      const total = Number(
+        pageInfo.totalRows ??
+          pageInfo.total ??
+          0,
+      )
+
+      /**
+       * 本页没数据，说明翻到头了。
+       */
+      if (list.length === 0) {
+        break
+      }
+
+      /**
+       * 已取够总条数。
+       */
       if (
-        list.length === 0 ||
+        total > 0 &&
         all.length >= total
       ) {
+        break
+      }
+
+      /**
+       * 数据源明确告诉这是最后一页。
+       */
+      if (
+        pageInfo.isLastPage ===
+        true
+      ) {
+        break
+      }
+
+      /**
+       * 兜底：本页不满一页，
+       * 后面不可能再有数据。
+       */
+      if (list.length < limit) {
         break
       }
 

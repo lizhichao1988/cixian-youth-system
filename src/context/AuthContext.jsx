@@ -35,6 +35,10 @@ import {
   changePassword as changePasswordRequest,
 } from '../api/authApi'
 
+import {
+  clearYouthCache,
+} from '../store/youthCache'
+
 const AuthContext =
   createContext(null)
 
@@ -139,6 +143,14 @@ export function AuthProvider({
           password,
         )
 
+      /**
+       * 换人登录时先清掉内存里的青少年缓存。
+       *
+       * 不清的话，
+       * 上一个人看过的全县数据会留到下一个账号的页面上。
+       */
+      clearYouthCache()
+
       setToken(data.token)
       setUser(data.user)
 
@@ -162,6 +174,13 @@ export function AuthProvider({
       }
 
       clearToken()
+
+      /**
+       * 退出登录必须清掉青少年缓存，
+       * 否则下一个人登录时能看到上一个人的数据。
+       */
+      clearYouthCache()
+
       setUser(null)
       setMustChangePassword(false)
     },

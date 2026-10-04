@@ -70,11 +70,34 @@ function getYouthId(youth) {
 const youthMap = new Map()
 
 /**
+ * 「本会话内新增 / 编辑过」的人员 ID。
+ *
+ * 为什么要单独记一份：
+ *
+ *     帮扶页的 mergeYouthCache() 会把缓存里的记录
+ *     补进列表里，好让刚新增的人立刻出现。
+ *
+ *     但缓存是全量加载时写进去的，
+ *     如果换了个乡镇账号登录、
+ *     而缓存里还留着上一个账号看过的全县数据，
+ *     合并之后乡镇账号就能看到别的乡镇的人——
+ *     这是实打实的越权。
+ *
+ *     所以只有新增 / 编辑时主动写入的记录
+ *     才允许被补进列表，
+ *     全量加载写进去的一律不算。
+ */
+const freshIds = new Set()
+
+/**
  * 本会话内“刚新增、需要在帮扶页自动选中”的人员 ID。
  */
 let pendingShowId = null
 
-export function cacheYouth(record) {
+export function cacheYouth(
+  record,
+  options = {},
+) {
   const id = getYouthId(record)
 
   if (!id) {
@@ -85,6 +108,10 @@ export function cacheYouth(record) {
     id,
     { ...record },
   )
+
+  if (options.fresh) {
+    freshIds.add(id)
+  }
 }
 
 export function getCachedYouth(id) {
@@ -107,6 +134,8 @@ export function removeCachedYouth(id) {
   youthMap.delete(
     String(id),
   )
+
+  freshIds.delete(String(id))
 }
 
 export function syncYouthCache(list = []) {
@@ -119,6 +148,29 @@ export function syncYouthCache(list = []) {
   })
 }
 
+/**
+ * 用新列表整体替换缓存。
+ *
+ * 每次重新读取全量数据、
+ * 以及切换登录账号时都必须走这个，
+ * 不能用 syncYouthCache() 往里累加。
+ *
+ * 累加的后果：
+ *
+ *     管理员先看过的 1181 条留在缓存里，
+ *     换成乡镇账号登录以后，
+ *     后端只返回本乡镇 118 条，
+ *     但缓存里那 1063 条还在，
+ *     帮扶页一合并又全冒出来了。
+ */
+export function resetYouthCache(list = []) {
+  youthMap.clear()
+
+  freshIds.clear()
+
+  syncYouthCache(list)
+}
+
 export function getAllCachedYouth() {
   return Array.from(
     youthMap.values(),
@@ -126,12 +178,18 @@ export function getAllCachedYouth() {
 }
 
 /**
- * 把内存缓存合并进现有列表：
+ * 把「本会话新增 / 编辑过」的记录合并进现有列表。
  *
- *   以 ID 去重；
- *   缓存里的记录（最新、服务器已确认）覆盖列表里的旧数据；
- *   缓存里有、列表里还没有的（刚新增尚未进列表的极端情况）
- *   也一并补进去。
+ * 规则（和以前不一样，别改回去）：
+ *
+ *   1. 以传入的列表为准——
+ *      列表是后端按账号权限返回的结果，
+ *      它决定“你能看到谁”。
+ *   2. 只有 freshIds 里的记录才补进列表，
+ *      也就是本会话真正新增 / 编辑过、
+ *      服务器已确认的那几条。
+ *   3. 全量加载写进缓存的历史记录一律不补，
+ *      否则换账号登录时会把上一个账号的数据带过来。
  */
 export function mergeYouthCache(list = []) {
   const arr =
@@ -152,15 +210,13 @@ export function mergeYouthCache(list = []) {
     }
   })
 
-  youthMap.forEach((record, id) => {
-    /**
-     * 缓存是“最新、服务器已确认”的版本，
-     * 一律以它为准（覆盖或补位）。
-     */
-    byId.set(
-      id,
-      record,
-    )
+  freshIds.forEach((id) => {
+    const record =
+      youthMap.get(id)
+
+    if (record) {
+      byId.set(id, record)
+    }
   })
 
   return Array.from(
@@ -185,6 +241,8 @@ export function consumePendingShowYouth() {
 
 export function clearYouthCache() {
   youthMap.clear()
+
+  freshIds.clear()
 
   pendingShowId = null
 }

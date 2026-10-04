@@ -50,7 +50,8 @@ import {
 } from '../utils/riskUtils'
 
 import {
-  syncYouthCache,
+  clearYouthCache,
+  resetYouthCache,
 } from '../store/youthCache'
 
 
@@ -197,6 +198,15 @@ function useYouthData({
 
     if (!ready || !userKey) {
       setAllYouthData([])
+
+      /**
+       * 没登录 / 正在换登录态时把缓存清空。
+       *
+       * 否则退出登录后再用乡镇账号登录，
+       * 上一个账号的数据还留在内存里。
+       */
+      clearYouthCache()
+
       setLoading(false)
 
       return
@@ -279,13 +289,23 @@ function useYouthData({
         )
 
         /**
-         * 同步进前端内存缓存。
+         * 整体替换前端内存缓存。
+         *
+         * 这里必须是 replace 而不是累加：
+         *
+         *     后端返回的就是“这个账号能看到的全部数据”，
+         *     缓存必须和它完全一致。
+         *
+         *     累加的话，换账号登录后
+         *     上一个账号的数据会残留在缓存里，
+         *     帮扶页一合并就又全冒出来了
+         *     （乡镇账号因此能看到全县 1181 条）。
          *
          * 这样无论是“新增 / 编辑”还是“刷新页面后重新读取”，
          * 内存缓存始终与服务器数据保持一致，
          * 帮扶管理页等其它页面都能立刻读到最新记录。
          */
-        syncYouthCache(
+        resetYouthCache(
           records,
         )
 
@@ -320,10 +340,14 @@ function useYouthData({
 
 
         /**
-         * 读取失败时清空数据。
+         * 读取失败时清空数据，
+         * 缓存也一起清掉，
+         * 避免残留上一次的旧数据被合并出来。
          */
 
         setAllYouthData([])
+
+        clearYouthCache()
 
       } finally {
 

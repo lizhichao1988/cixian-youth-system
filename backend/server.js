@@ -1563,6 +1563,141 @@ app.post(
   }
 )
 
+/**
+ * =========================================================
+ * 风险排查记录的归属校验
+ * =========================================================
+ *
+ * 覆盖：
+ *
+ *     PUT    /api/risks/:riskId
+ *     DELETE /api/risks/:riskId
+ *
+ * 为什么要单独加这个：
+ *
+ *     实测发现，讲武城镇账号直接请求
+ *     DELETE /api/risks/1188
+ *     （1188 属于磁州镇的某名青少年）
+ *     后端返回 200「删除成功」，
+ *     风险记录真的被删掉了。
+ *
+ *     原因是这两个路由只认 riskId，
+ *     从来没问过「这条记录是哪个乡镇的」，
+ *     而按 id 删除又不像列表那样走归口单位过滤，
+ *     于是乡镇账号可以改 / 删全县任意一条风险记录。
+ *
+ * 判断方式：
+ *
+ *     1. 先查内存里的子表反查索引（快）
+ *     2. 索引里没有就直接读那条风险记录，
+ *        从关联的青少年 Id 反推归属
+ *     3. 确认不了归属一律拒绝，
+ *        绝不放行
+ */
+async function guardRiskScope(req, res, next) {
+  const user = req.user
+
+  if (!user) {
+    return res.status(401).json({
+      success: false,
+      message: '请先登录',
+    })
+  }
+
+  /**
+   * 管理员 / 县级看全县，不需要过滤。
+   */
+  if (user.role !== 'town') {
+    return next()
+  }
+
+  const riskId = String(
+    req.params?.riskId || '',
+  ).trim()
+
+  if (!riskId) {
+    return res.status(400).json({
+      success: false,
+      message: '缺少风险排查记录ID',
+    })
+  }
+
+  try {
+    const data = await loadYouthData(false)
+
+    let youth =
+      ensureChildIndex(data).get(riskId) ||
+      null
+
+    /**
+     * 索引里没命中，
+     * 直接读这条风险记录反查所属青少年。
+     */
+    if (!youth) {
+      const response = await fetch(
+        NOCODB_BASE_URL +
+          '/api/v2/tables/' +
+          TABLE_IDS.risks +
+          '/records/' +
+          encodeURIComponent(riskId),
+        { headers: getHeaders() },
+      )
+
+      if (response.ok) {
+        const row =
+          await response.json()
+
+        const link =
+          row?.['青少年基本信息表']
+
+        const first =
+          Array.isArray(link)
+            ? link[0]
+            : link
+
+        const youthId = Number(
+          first?.Id ?? 0,
+        )
+
+        if (youthId > 0) {
+          youth = findYouthById(
+            String(youthId),
+          )
+        }
+      }
+    }
+
+    if (!youth) {
+      return res.status(403).json({
+        success: false,
+        message:
+          '无法确认这条风险记录的归属单位，已拒绝操作。请刷新页面后重试。',
+      })
+    }
+
+    if (!canAccessYouth(user, youth)) {
+      return res.status(403).json({
+        success: false,
+        message:
+          '只能操作本乡镇（归口单位）的数据',
+      })
+    }
+
+    return next()
+  } catch (error) {
+    console.error(
+      '风险记录归属校验失败：',
+      error?.message || error,
+    )
+
+    return res.status(500).json({
+      success: false,
+      message:
+        '权限校验失败，请稍后重试',
+    })
+  }
+}
+
 /* ---------------------------------------------------------
    修改已有风险排查记录
 
@@ -1577,6 +1712,7 @@ app.post(
    --------------------------------------------------------- */
 app.put(
   '/api/risks/:riskId',
+  guardRiskScope,
   async (req, res) => {
     const riskId =
       String(
@@ -2110,6 +2246,7 @@ app.put(
    --------------------------------------------------------- */
 app.delete(
   '/api/risks/:riskId',
+  guardRiskScope,
   async (req, res) => {
     const riskId =
       String(

@@ -161,6 +161,19 @@ export function ForceChangePasswordModal() {
               · 不要使用 12345678
               这类简单组合
             </div>
+            <div
+              style={{
+                marginTop: 6,
+                color:
+                  '#d4380d',
+                fontWeight:
+                  600,
+              }}
+            >
+              在修改密码之前，
+              系统不会返回任何业务数据，
+              页面显示为空是正常现象。
+            </div>
           </div>
         }
       />

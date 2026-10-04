@@ -1147,8 +1147,17 @@ async function syncRiskRecords(
          * 帮扶管理页等其它页面可直接读取，
          * 切过去就能看到新增的人员。
          */
+        /**
+         * fresh: true 很关键。
+         *
+         * 只有标记为 fresh 的记录
+         * 才会被合并进帮扶页的列表，
+         * 这样新增的人能立刻出现，
+         * 又不会把别的账号的数据带过来。
+         */
         cacheYouth(
           savedNewRecord,
+          { fresh: true },
         )
 
         /**
@@ -1256,8 +1265,13 @@ async function syncRiskRecords(
        * 10. 数据库成功后再更新前端列表
        * -------------------------------------------------------
        */
+      /**
+       * 同样标成 fresh：
+       * 编辑保存后帮扶页要能立刻看到最新内容。
+       */
       cacheYouth(
         savedRecord,
+        { fresh: true },
       )
 
       setAllYouthData(

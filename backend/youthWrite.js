@@ -895,9 +895,19 @@ function createYouthWriter({
     const data =
       await response.json()
 
-    const total =
-      data?.pageInfo
-        ?.totalRows ?? 0
+    /**
+     * 同样要兼容两种分页字段。
+     *
+     * 只认 totalRows 的话，
+     * 遇到返回 total 的数据源会算成 0，
+     * 新增青少年的序号就永远是 1，
+     * 整张表出现一堆重复序号。
+     */
+    const total = Number(
+      data?.pageInfo?.totalRows ??
+        data?.pageInfo?.total ??
+        0,
+    )
 
     return total + 1
   }

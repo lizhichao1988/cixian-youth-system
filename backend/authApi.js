@@ -348,12 +348,50 @@ function validatePassword(
 
   const lower = value.toLowerCase()
 
+  /**
+   * 只拦截「词根本身」和「词根 + 简单数字后缀」。
+   *
+   * 之前这里写的是 startsWith(root)，
+   * 也就是只要以 admin / password 开头就判弱，
+   * 结果连 Admin@2026#cixian 这种
+   * 长度够、带符号、撞库工具未必试的密码
+   * 也被一刀切拦下，
+   * 管理员一登录就被锁、看不到任何数据。
+   *
+   * 现在先去掉特殊符号再看结构：
+   *
+   *     admin          弱
+   *     admin123       弱（词根 + 1~4 位数字）
+   *     admin@123      弱（符号去掉后同上）
+   *     Admin@2026#cx  通过（词根后面还有复杂内容）
+   */
+  const stripped = lower.replace(
+    /[^a-z0-9]/g,
+    '',
+  )
+
   if (
-    WEAK_ROOTS.some(
-      (root) =>
-        lower === root ||
-        lower.startsWith(root),
-    )
+    WEAK_ROOTS.some((root) => {
+      if (stripped === root) {
+        return true
+      }
+
+      if (!stripped.startsWith(root)) {
+        return false
+      }
+
+      const rest = stripped.slice(
+        root.length,
+      )
+
+      /**
+       * 词根后面只跟 1~4 位数字。
+       *
+       * 超过 4 位或者还带了别的字母，
+       * 就认为不是简单字典词了。
+       */
+      return /^\d{1,4}$/.test(rest)
+    })
   ) {
     return '密码包含常见弱口令，请换一个'
   }
