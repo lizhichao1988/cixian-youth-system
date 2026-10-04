@@ -39,6 +39,34 @@ import {
   clearYouthCache,
 } from '../store/youthCache'
 
+/**
+ * 清掉“跟着人走”的界面记忆。
+ *
+ * 这些值存在 sessionStorage 里，本来是为了
+ * 刷新页面不跳页、帮扶页记住上次看的人。
+ *
+ * 但它们不属于任何一个账号：
+ * 换个乡镇账号登录后，帮扶页会照着
+ * 上一个账号选中的人去取数，
+ * 那人是别的乡镇的，后端直接 403，
+ * 屏幕上就糊一片“只能查看本乡镇数据”。
+ *
+ * 所以换账号时一并清掉。
+ */
+function clearSessionUiState() {
+  try {
+    window.sessionStorage.removeItem(
+      'cixian_help_selected',
+    )
+
+    window.sessionStorage.removeItem(
+      'cixian_active_page',
+    )
+  } catch {
+    /* 隐私模式下失败不影响主流程 */
+  }
+}
+
 const AuthContext =
   createContext(null)
 
@@ -150,6 +178,7 @@ export function AuthProvider({
        * 上一个人看过的全县数据会留到下一个账号的页面上。
        */
       clearYouthCache()
+      clearSessionUiState()
 
       setToken(data.token)
       setUser(data.user)
@@ -180,6 +209,7 @@ export function AuthProvider({
        * 否则下一个人登录时能看到上一个人的数据。
        */
       clearYouthCache()
+      clearSessionUiState()
 
       setUser(null)
       setMustChangePassword(false)
